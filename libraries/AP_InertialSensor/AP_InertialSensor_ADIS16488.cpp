@@ -16,8 +16,27 @@
 #include <utility>
 #include <AP_HAL/AP_HAL.h>
 #include <AP_Math/AP_Math.h>
+#include <GCS_MAVLink/GCS.h>
 
 #include "AP_InertialSensor_ADIS16488.h"
+
+/*
+  set to 1 to report every step of the probe to the GCS. The console is
+  not reachable on boards whose only serial port carries MAVLink, so
+  this goes out as statustext and lands in the ground station messages.
+ */
+#ifndef AP_INERTIALSENSOR_ADIS16488_DEBUG
+#define AP_INERTIALSENSOR_ADIS16488_DEBUG 0
+#endif
+
+#if AP_INERTIALSENSOR_ADIS16488_DEBUG
+#define ADIS_DEBUG(fmt, args ...) GCS_SEND_TEXT(MAV_SEVERITY_INFO, "ADIS16488: " fmt, ##args)
+#else
+#define ADIS_DEBUG(fmt, args ...)
+#endif
+
+// a failed probe leaves the vehicle with no IMU at all, so always say why
+#define ADIS_ERROR(fmt, args ...) GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "ADIS16488: " fmt, ##args)
 
 /*
   registers are identified by the page they live on as well as their
@@ -72,8 +91,16 @@
  */
 // minimum gap the sensor needs between two 16 bit frames
 #define T_STALL_US   2U
-// a software reset takes 120ms to run, allow margin for start-up too
-#define T_RESET_MS   250U
+
+/*
+  the datasheet gives 500ms for both the power-on start-up time and the
+  reset recovery time, as the time until data is available. Waiting any
+  less risks resetting the part again while it is still recovering.
+ */
+#define T_RESET_MS   550U
+
+// how many reset-and-retry rounds we give the part before giving up
+#define PROBE_TRIES  5U
 
 /*
   the output stage always runs at 2460 SPS, and DEC_RATE decimates it
@@ -177,11 +204,13 @@ void AP_InertialSensor_ADIS16488::start()
 }
 
 /*
-  check product ID and set the scaling that goes with it
+  check product ID and set the scaling that goes with it. The raw value
+  read is returned so a failed probe can report what it actually saw.
  */
-bool AP_InertialSensor_ADIS16488::check_product_id()
+bool AP_InertialSensor_ADIS16488::check_product_id(uint16_t &id)
 {
-    if (read_reg16(REG_PROD_ID) != PROD_ID_16488) {
+    id = read_reg16(REG_PROD_ID);
+    if (id != PROD_ID_16488) {
         return false;
     }
 
@@ -207,37 +236,54 @@ bool AP_InertialSensor_ADIS16488::init()
     // stay slow until we know the part is answering
     dev->set_speed(AP_HAL::Device::SPEED_LOW);
 
-    uint8_t tries = 8;
-    while (tries > 0) {
-        /*
-          a software reset restores every register from flash and
-          restarts data collection, which also puts us back on page 0
-         */
-        write_reg16(REG_GLOB_CMD, GLOB_CMD_SW_RESET);
-        hal.scheduler->delay(T_RESET_MS);
-        current_page = PAGE_UNKNOWN;
-        if (check_product_id()) {
+    ADIS_DEBUG("probe start, drdy pin %u", (unsigned)drdy_pin);
+
+    /*
+      take the part as we find it first. If it is already up and
+      identifying correctly there is nothing to reset, and we save the
+      better part of a second of boot time. Only if that fails do we
+      reset and wait out the full recovery time before looking again.
+     */
+    uint16_t prod_id = 0;
+    bool found = false;
+    for (uint8_t i=0; i<PROBE_TRIES; i++) {
+        found = check_product_id(prod_id);
+        ADIS_DEBUG("try %u PROD_ID 0x%04x", (unsigned)i, (unsigned)prod_id);
+        if (found) {
             break;
         }
-        tries--;
+        write_reg16(REG_GLOB_CMD, GLOB_CMD_SW_RESET);
+        hal.scheduler->delay(T_RESET_MS);
+        // the reset puts the part back on page 0
+        current_page = PAGE_UNKNOWN;
     }
-    if (tries == 0) {
+    if (!found) {
+        /*
+          0x0000 usually means MISO is stuck low or the part has no
+          power, 0xFFFF that MISO is floating or chip select never
+          asserts. Anything else is a different part on this bus.
+         */
+        ADIS_ERROR("bad PROD_ID 0x%04x want 0x%04x", (unsigned)prod_id, (unsigned)PROD_ID_16488);
         return false;
     }
 
     /*
       the start-up self test result is latched in DIAG_STS. We only
       care about the gyro and accel bits, the magnetometer and
-      barometer in this part are not used by this driver.
+      barometer in this part are not used by this driver. Reading it
+      clears it, so read it before SYS_E_FLAG, whose bit 5 only mirrors
+      whether DIAG_STS was non zero.
      */
     const uint16_t diag_sts = read_reg16(REG_DIAG_STS);
+    // reading SYS_E_FLAG is what clears the start-up error flags, so it
+    // is done for the side effect even when we are not reporting it
+    const uint16_t sys_e_flag = read_reg16(REG_SYS_E_FLAG);
+    (void)sys_e_flag;
+    ADIS_DEBUG("DIAG_STS 0x%04x SYS_E_FLAG 0x%04x", (unsigned)diag_sts, (unsigned)sys_e_flag);
     if ((diag_sts & DIAG_STS_INERTIAL_MASK) != 0) {
-        DEV_PRINTF("ADIS16488: self test failed 0x%04x\n", (unsigned)diag_sts);
+        ADIS_ERROR("self test failed 0x%04x", (unsigned)diag_sts);
         return false;
     }
-
-    // reading SYS_E_FLAG clears the flags left over from start-up
-    read_reg16(REG_SYS_E_FLAG);
 
     /*
       pick the decimation that lands closest to the rate we want. The
@@ -253,22 +299,6 @@ bool AP_InertialSensor_ADIS16488::init()
 
     temp_publish_count = MAX(1U, uint32_t(expected_sample_rate_hz) / TEMP_PUBLISH_HZ);
 
-    if (!write_reg16(REG_DEC_RATE, uint16_t(d - 1), true)) {
-        return false;
-    }
-
-    // no FIR filtering, the frontend does its own
-    if (!write_reg16(REG_FILTR_BNK_0, 0, true) ||
-        !write_reg16(REG_FILTR_BNK_1, 0, true)) {
-        return false;
-    }
-
-    // keep the linear-g and point of percussion compensation that the
-    // factory default turns on
-    if (!write_reg16(REG_CONFIG, CONFIG_LINEAR_G_COMP | CONFIG_POINT_OF_PERCUSSION, true)) {
-        return false;
-    }
-
     /*
       pulse data ready high on the DIOx line the board is wired to.
       This also clears the sync clock input and the alarm indicator,
@@ -276,9 +306,31 @@ bool AP_InertialSensor_ADIS16488::init()
      */
     const uint16_t fnctio_ctrl = FNCTIO_CTRL_DR_ENABLE | FNCTIO_CTRL_DR_POLARITY |
         ((AP_INERTIALSENSOR_ADIS16488_DRDY_DIO - 1) & FNCTIO_CTRL_DR_LINE_MASK);
-    if (!write_reg16(REG_FNCTIO_CTRL, fnctio_ctrl, true)) {
-        return false;
+
+    const struct {
+        const char *name;
+        uint16_t reg;
+        uint16_t value;
+    } config[] = {
+        { "DEC_RATE",    REG_DEC_RATE,    uint16_t(d - 1) },
+        // no FIR filtering, the frontend does its own
+        { "FILTR_BNK_0", REG_FILTR_BNK_0, 0 },
+        { "FILTR_BNK_1", REG_FILTR_BNK_1, 0 },
+        // keep the linear-g and point of percussion compensation that
+        // the factory default turns on
+        { "CONFIG",      REG_CONFIG,      CONFIG_LINEAR_G_COMP | CONFIG_POINT_OF_PERCUSSION },
+        { "FNCTIO_CTRL", REG_FNCTIO_CTRL, fnctio_ctrl },
+    };
+
+    for (const auto &c : config) {
+        if (!write_reg16(c.reg, c.value, true)) {
+            ADIS_ERROR("%s write failed, got 0x%04x", c.name, (unsigned)read_reg16(c.reg));
+            return false;
+        }
+        ADIS_DEBUG("%s = 0x%04x", c.name, (unsigned)c.value);
     }
+
+    ADIS_DEBUG("ready at %u Hz", (unsigned)expected_sample_rate_hz);
 
     /*
       frames are only 16 bits each and we need a lot of them per

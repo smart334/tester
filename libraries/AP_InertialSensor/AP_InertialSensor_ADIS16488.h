@@ -92,7 +92,7 @@ private:
       initialise driver
      */
     bool init();
-    bool check_product_id();
+    bool check_product_id(uint16_t &id);
     void read_sensor(void);
     void loop(void);
 
