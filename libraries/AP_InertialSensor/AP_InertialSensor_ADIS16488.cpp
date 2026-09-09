@@ -13,6 +13,7 @@
  * with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdarg.h>
 #include <utility>
 #include <AP_HAL/AP_HAL.h>
 #include <AP_Math/AP_Math.h>
@@ -121,6 +122,14 @@
 
 // how many times we retry a page switch before calling it lost
 #define PAGE_RETRIES 5U
+
+/*
+  how many times a probe failure is repeated to the ground station.
+  Statustext raised during init is dropped outright, not queued, once
+  the streaming channel mask has been worked out but no link is
+  streaming yet, and a failing probe sits right in that window.
+ */
+#define FAILURE_REPEATS 4U
 
 /*
   the output stage always runs at 2460 SPS, and DEC_RATE decimates it
@@ -260,16 +269,6 @@ bool AP_InertialSensor_ADIS16488::init()
     ADIS_DEBUG("probe start, drdy pin %u", (unsigned)drdy_pin);
 
     /*
-      the part shares our supply and needs 500ms from power on before
-      data is available. Identifying early can succeed while the part is
-      still finishing start-up, so wait that out before configuring it.
-     */
-    const uint32_t now_ms = AP_HAL::millis();
-    if (now_ms < T_STARTUP_MS) {
-        hal.scheduler->delay(T_STARTUP_MS - now_ms);
-    }
-
-    /*
       take the part as we find it first. If it is already up and
       identifying correctly there is nothing to reset, and we save the
       better part of a second of boot time. Only if that fails do we
@@ -283,6 +282,20 @@ bool AP_InertialSensor_ADIS16488::init()
         if (found) {
             break;
         }
+        /*
+          the part shares our supply and needs 500ms from power on
+          before data is available, so on the first pass wait out
+          whatever is left of that rather than resetting a part that was
+          simply not up yet. Note that any delay here runs the mavlink
+          delay callback, after which statustext raised from init can be
+          dropped, so nothing above this point may depend on it.
+         */
+        const uint32_t now_ms = AP_HAL::millis();
+        if (i == 0 && now_ms < T_STARTUP_MS) {
+            hal.scheduler->delay(T_STARTUP_MS - now_ms);
+            continue;
+        }
+
         write_reg16(REG_GLOB_CMD, GLOB_CMD_SW_RESET);
         hal.scheduler->delay(T_RESET_MS);
         // the reset puts the part back on page 0
@@ -294,7 +307,7 @@ bool AP_InertialSensor_ADIS16488::init()
           power, 0xFFFF that MISO is floating or chip select never
           asserts. Anything else is a different part on this bus.
          */
-        ADIS_ERROR("bad PROD_ID 0x%04x want 0x%04x", (unsigned)prod_id, (unsigned)PROD_ID_16488);
+        report_failure("bad PROD_ID 0x%04x want 0x%04x", (unsigned)prod_id, (unsigned)PROD_ID_16488);
         return false;
     }
 
@@ -312,7 +325,7 @@ bool AP_InertialSensor_ADIS16488::init()
     (void)sys_e_flag;
     ADIS_DEBUG("DIAG_STS 0x%04x SYS_E_FLAG 0x%04x", (unsigned)diag_sts, (unsigned)sys_e_flag);
     if ((diag_sts & DIAG_STS_INERTIAL_MASK) != 0) {
-        ADIS_ERROR("self test failed 0x%04x", (unsigned)diag_sts);
+        report_failure("self test failed 0x%04x", (unsigned)diag_sts);
         return false;
     }
 
@@ -380,8 +393,8 @@ bool AP_InertialSensor_ADIS16488::init()
             const unsigned got = read_reg16(c.reg);
             const unsigned page = read_reg16_raw(PAGE_ID_ADDR);
             const unsigned sys_e = read_reg16(REG_SYS_E_FLAG);
-            ADIS_ERROR("%s write failed, got 0x%04x", c.name, got);
-            ADIS_ERROR("on page %u, SYS_E_FLAG 0x%04x", page, sys_e);
+            report_failure("%s write failed, got 0x%04x", c.name, got);
+            report_failure("on page %u, SYS_E_FLAG 0x%04x", page, sys_e);
             return false;
         }
         ADIS_DEBUG("%s = 0x%04x", c.name, (unsigned)c.value);
@@ -410,6 +423,26 @@ void AP_InertialSensor_ADIS16488::stall(void) const
 {
     const uint32_t tstart = AP_HAL::micros();
     while (AP_HAL::micros() - tstart < stall_us) {
+    }
+}
+
+/*
+  report a probe failure to the ground station, repeatedly, so that it
+  survives the window during init where statustext goes nowhere
+ */
+void AP_InertialSensor_ADIS16488::report_failure(const char *fmt, ...) const
+{
+    char msg[MAVLINK_MSG_STATUSTEXT_FIELD_TEXT_LEN];
+    va_list ap;
+    va_start(ap, fmt);
+    hal.util->vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    for (uint8_t i=0; i<FAILURE_REPEATS; i++) {
+        ADIS_ERROR("%s", msg);
+        if (uint8_t(i+1) < FAILURE_REPEATS) {
+            hal.scheduler->delay(1000);
+        }
     }
 }
 
@@ -452,6 +485,7 @@ bool AP_InertialSensor_ADIS16488::set_page(uint8_t page)
         return true;
     }
 
+    uint16_t seen = 0;
     for (uint8_t i=0; i<PAGE_RETRIES; i++) {
         // PAGE_ID is the one register that takes a new value from a
         // write to its lower byte alone
@@ -463,15 +497,27 @@ bool AP_InertialSensor_ADIS16488::set_page(uint8_t page)
         }
         stall();
 
-        // PAGE_ID appears at the same address on every page, so it can
-        // be read back without knowing where we ended up
-        if (read_reg16_raw(PAGE_ID_ADDR) == page) {
+        /*
+          PAGE_ID appears at the same address on every page, so it can
+          be read back without knowing where we ended up. Only the low
+          byte carries the page code: the datasheet gives PAGE_ID no bit
+          format at all, so the upper byte cannot be assumed to be zero.
+         */
+        seen = read_reg16_raw(PAGE_ID_ADDR);
+        if ((seen & 0xFF) == page) {
             current_page = page;
             return true;
         }
     }
 
-    return false;
+    /*
+      The read back did not settle. Carry on as if the write took, which
+      is what we did before this check existed, rather than lose the
+      sensor to a register whose format the datasheet never pins down.
+     */
+    ADIS_DEBUG("page %u readback 0x%04x", (unsigned)page, (unsigned)seen);
+    current_page = page;
+    return true;
 }
 
 /*

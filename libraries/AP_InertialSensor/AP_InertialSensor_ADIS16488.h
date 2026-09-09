@@ -99,6 +99,9 @@ private:
     // hold off for the minimum stall period between two SPI frames
     void stall(void) const;
 
+    // report a probe failure to the ground station
+    void report_failure(const char *fmt, ...) const FMT_PRINTF(2, 3);
+
     // select the register page a register lives on
     bool set_page(uint8_t page);
 
