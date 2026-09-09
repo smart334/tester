@@ -157,6 +157,30 @@
 #define AP_INERTIALSENSOR_ADIS16488_DRDY_DIO 2
 #endif
 
+/*
+  Run without ever writing to the part.
+
+  Three of the four registers this driver configures already hold the
+  value it wants as their factory default: CONFIG is 0x00C0, which is
+  the linear-g and point of percussion compensation on, FNCTIO_CTRL is
+  0x000D, which is data ready enabled and positive on DIO2, and both
+  filter banks are zero, which is the FIR filtering off. Only DEC_RATE
+  differs, and its default of zero simply leaves the part at its full
+  2460Hz output rate instead of the decimated one.
+
+  Every register the sample loop reads is on page 0, and the part powers
+  up on page 0, so a driver that takes those defaults never needs to
+  write anything at all, not even a page select.
+
+  This is for bringing up a board whose writes do not reach the part. It
+  cannot check what the part is actually configured to do, because the
+  control registers are on a page it cannot select, so it trusts the
+  defaults rather than verifying them.
+ */
+#ifndef AP_INERTIALSENSOR_ADIS16488_READ_ONLY
+#define AP_INERTIALSENSOR_ADIS16488_READ_ONLY 0
+#endif
+
 // TEMP_OUT reads 0.00565 degC per LSB with 25degC at zero
 #define TEMP_SCALE_C  0.00565f
 #define TEMP_OFFSET_C 25.0f
@@ -271,6 +295,12 @@ bool AP_InertialSensor_ADIS16488::init()
 
     ADIS_DEBUG("probe start, drdy pin %u", (unsigned)drdy_pin);
 
+#if AP_INERTIALSENSOR_ADIS16488_READ_ONLY
+    // the part powers up on page 0 and everything we read lives there,
+    // so take that as given rather than writing a page select
+    current_page = PAGE_OUTPUT;
+#endif
+
     /*
       take the part as we find it first. If it is already up and
       identifying correctly there is nothing to reset, and we save the
@@ -299,10 +329,15 @@ bool AP_InertialSensor_ADIS16488::init()
             continue;
         }
 
+#if AP_INERTIALSENSOR_ADIS16488_READ_ONLY
+        // a reset is a write, so there is nothing left to try
+        break;
+#else
         write_reg16(REG_GLOB_CMD, GLOB_CMD_SW_RESET);
         hal.scheduler->delay(T_RESET_MS);
         // the reset puts the part back on page 0
         current_page = PAGE_UNKNOWN;
+#endif
     }
     if (!found) {
         /*
@@ -356,6 +391,18 @@ bool AP_InertialSensor_ADIS16488::init()
         return false;
     }
 
+#if AP_INERTIALSENSOR_ADIS16488_READ_ONLY
+    /*
+      Take the factory defaults and read. DEC_RATE defaults to zero, so
+      the part is running undecimated at its full rate, and that is the
+      rate the frontend has to be told about.
+     */
+    expected_sample_rate_hz = INTERNAL_RATE_HZ;
+    period_us = (1000000UL / INTERNAL_RATE_HZ) - 20U;
+    temp_publish_count = MAX(1U, INTERNAL_RATE_HZ / TEMP_PUBLISH_HZ);
+
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ADIS16488: read only, config not verified");
+#else
     /*
       Chip select has to frame the transfers for a write to commit, and
       a part that stays selected reads perfectly while never committing
@@ -468,6 +515,8 @@ bool AP_InertialSensor_ADIS16488::init()
     stall_us = T_STALL_US;
 
     ADIS_DEBUG("ready at %u Hz", (unsigned)expected_sample_rate_hz);
+
+#endif  // AP_INERTIALSENSOR_ADIS16488_READ_ONLY
 
     /*
       frames are only 16 bits each and we need a lot of them per
