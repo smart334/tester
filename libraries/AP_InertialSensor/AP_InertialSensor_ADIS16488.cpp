@@ -594,16 +594,25 @@ bool AP_InertialSensor_ADIS16488::cs_frames_transfers(void)
     }
     stall();
 
-    const bool framed = read_reg16_raw(REG_ADDR(REG_PROD_ID)) == PROD_ID_16488;
-
-    if (!framed) {
-        // we have shifted a permanently selected part by half a frame,
-        // shift it back so the rest of the probe still works
-        dev->transfer_fullduplex(odd, sizeof(odd));
-        stall();
+    if (read_reg16_raw(REG_ADDR(REG_PROD_ID)) == PROD_ID_16488) {
+        // the odd byte changed nothing, so every assertion frames afresh
+        return true;
     }
 
-    return framed;
+    /*
+      The identity is gone, so the part is carrying our bit alignment
+      from one transfer to the next instead of being reframed. Shift it
+      back with a second odd byte and check: an alignment that can be
+      moved and moved back is one chip select is not resetting, which is
+      only possible if it never rises.
+     */
+    dev->transfer_fullduplex(odd, sizeof(odd));
+    stall();
+    const bool restored = read_reg16_raw(REG_ADDR(REG_PROD_ID)) == PROD_ID_16488;
+    (void)restored;
+    ADIS_DEBUG("cs shift %s", restored ? "confirmed" : "unclear");
+
+    return false;
 }
 
 /*
