@@ -105,11 +105,24 @@ private:
     // select the register page a register lives on
     bool set_page(uint8_t page);
 
+    /*
+      how much padding a write command needs inside its chip select
+      window for the part to act on it. See write_frame().
+     */
+    enum write_pad_t : uint8_t {
+        WRITE_PAD_NONE = 0,
+        WRITE_PAD_LEAD = 1,
+        WRITE_PAD_BOTH = 2,
+    };
+
     // send one write command frame
     bool write_frame(uint8_t addr, uint8_t data) const;
 
     // check whether the write bit is reaching the part
     bool write_bit_ok(void) const;
+
+    // check whether a write actually changes a register
+    bool page_write_works(void);
 
     // read a 16 bit register on whatever page is currently selected
     uint16_t read_reg16_raw(uint8_t addr) const;
@@ -132,9 +145,8 @@ private:
     // gap held between two SPI frames, relaxed while configuring
     uint8_t stall_us;
 
-    // put a lead-in frame ahead of every write, for boards that lose
-    // the write bit when it is first on the wire
-    bool write_lead_in;
+    // padding used around every write command
+    write_pad_t write_pad;
 
     // running temperature average, published to the frontend at 20Hz
     float temp_sum;

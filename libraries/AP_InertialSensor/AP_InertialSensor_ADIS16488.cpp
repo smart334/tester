@@ -182,7 +182,7 @@ AP_InertialSensor_ADIS16488::AP_InertialSensor_ADIS16488(AP_InertialSensor &imu,
     , drdy_pin(drdy_gpio)
     , current_page(PAGE_UNKNOWN)
     , stall_us(T_STALL_INIT_US)
-    , write_lead_in(false)
+    , write_pad(WRITE_PAD_NONE)
     , temp_sum(0)
     , temp_count(0)
 {
@@ -331,31 +331,29 @@ bool AP_InertialSensor_ADIS16488::init()
     }
 
     /*
-      Does the write bit reach the part, and if not, can we get it there?
+      Find a transfer shape whose writes land.
 
-      Every read carries a zero in the write bit and an address of 0x7E
-      or below, so nothing that works has ever put a one in that
-      position. On a board that loses it the part receives every write
-      as a read of the same address and does nothing, which looks in the
-      register map exactly like a part refusing to write. Establish
-      which we have, and if leading the write with a harmless frame
-      inside the same chip select window gets the bit through, use that
-      shape for every write from here on.
+      Reads exercise neither the write bit nor the data byte, so a board
+      that mangles the start or the end of its chip select window reads
+      perfectly and writes nothing. Rather than guess which end, try the
+      shapes in order of cost and keep the first that can actually change
+      a register. A board with no such problem stops at the first.
      */
-    write_lead_in = false;
-    bool write_ok = write_bit_ok();
-    if (!write_ok) {
-        write_lead_in = true;
-        write_ok = write_bit_ok();
-        if (!write_ok) {
-            // neither shape gets it through, keep the simpler one
-            write_lead_in = false;
+    bool write_ok = false;
+    for (uint8_t pad = WRITE_PAD_NONE; pad <= WRITE_PAD_BOTH; pad++) {
+        write_pad = write_pad_t(pad);
+        const bool bit_ok = write_bit_ok();
+        write_ok = page_write_works();
+        (void)bit_ok;
+        ADIS_DEBUG("pad %u: bit %s write %s", (unsigned)pad,
+                   bit_ok ? "ok" : "LOST", write_ok ? "ok" : "LOST");
+        if (write_ok) {
+            break;
         }
     }
-    ADIS_DEBUG("write bit %s%s", write_ok ? "ok" : "LOST",
-               write_lead_in ? " with lead-in" : "");
     if (!write_ok) {
-        report_failure("write bit not reaching part");
+        write_pad = WRITE_PAD_NONE;
+        report_failure("no write shape reaches the part");
     }
 
 #if AP_INERTIALSENSOR_ADIS16488_DEBUG
@@ -476,25 +474,40 @@ void AP_InertialSensor_ADIS16488::report_failure(const char *fmt, ...) const
 }
 
 /*
-  send one write command frame.
+  send one write command frame, padded as the board needs.
 
-  On some boards the write bit does not survive being the first bit
-  clocked after chip select falls: the part then receives every write as
-  a read of the same address and quietly does nothing, while reads,
-  which always carry a zero there, work perfectly. Putting a harmless
-  read of PAGE_ID in front of the write inside the same chip select
-  window moves the write bit off the front of the transfer. The part
-  counts SPI clocks in groups of sixteen, so it sees the two frames the
-  same way it would see them separately.
+  Two bit positions in a frame are only ever exercised by writes. The
+  write bit is the first bit clocked after chip select falls, and the
+  data byte is the last thing clocked before it rises again: a read
+  carries a zero in the first and does not care about the second, so a
+  board that mangles either end of its chip select window passes every
+  read and loses every write.
+
+  Padding moves the command away from those ends. A harmless read of
+  PAGE_ID ahead of it puts the write bit off the front, and another
+  behind it puts the data byte off the back. The part counts SPI clocks
+  in groups of sixteen, so it sees the padded frames exactly as it would
+  see them sent separately.
  */
 bool AP_InertialSensor_ADIS16488::write_frame(uint8_t addr, uint8_t data) const
 {
-    if (write_lead_in) {
-        uint8_t buf[4] { PAGE_ID_ADDR, 0, uint8_t(addr | WRITE_FLAG), data };
-        return dev->transfer_fullduplex(buf, sizeof(buf));
+    uint8_t buf[6];
+    uint8_t n = 0;
+
+    if (write_pad != WRITE_PAD_NONE) {
+        buf[n++] = PAGE_ID_ADDR;
+        buf[n++] = 0;
     }
-    uint8_t buf[2] { uint8_t(addr | WRITE_FLAG), data };
-    return dev->transfer_fullduplex(buf, sizeof(buf));
+
+    buf[n++] = uint8_t(addr | WRITE_FLAG);
+    buf[n++] = data;
+
+    if (write_pad == WRITE_PAD_BOTH) {
+        buf[n++] = PAGE_ID_ADDR;
+        buf[n++] = 0;
+    }
+
+    return dev->transfer_fullduplex(buf, n);
 }
 
 /*
@@ -519,6 +532,28 @@ bool AP_InertialSensor_ADIS16488::write_bit_ok(void) const
     stall();
 
     return ((next[0] << 8U) | next[1]) != PROD_ID_16488;
+}
+
+/*
+  check whether a write actually changes a register, which needs the
+  write bit, the address and the data byte all to arrive.
+
+  PAGE_ID is the right target: it takes its new value from the low byte
+  alone, it reads back at the same address on every page, and putting it
+  back afterwards costs one more write.
+ */
+bool AP_InertialSensor_ADIS16488::page_write_works(void)
+{
+    write_frame(PAGE_ID_ADDR, PAGE_CONTROL);
+    stall();
+    const bool ok = (read_reg16_raw(PAGE_ID_ADDR) & 0xFF) == PAGE_CONTROL;
+
+    // leave the part back on the output page whatever happened
+    write_frame(PAGE_ID_ADDR, PAGE_OUTPUT);
+    stall();
+    current_page = PAGE_UNKNOWN;
+
+    return ok;
 }
 
 /*
