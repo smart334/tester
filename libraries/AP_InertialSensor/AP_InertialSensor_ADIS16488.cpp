@@ -112,6 +112,10 @@
  */
 #define T_RESET_MS   550U
 
+// time from power on before the part will answer, measured from boot as
+// it comes up on the same supply we do
+#define T_STARTUP_MS 500U
+
 // how many reset-and-retry rounds we give the part before giving up
 #define PROBE_TRIES  5U
 
@@ -254,6 +258,16 @@ bool AP_InertialSensor_ADIS16488::init()
     dev->set_speed(AP_HAL::Device::SPEED_LOW);
 
     ADIS_DEBUG("probe start, drdy pin %u", (unsigned)drdy_pin);
+
+    /*
+      the part shares our supply and needs 500ms from power on before
+      data is available. Identifying early can succeed while the part is
+      still finishing start-up, so wait that out before configuring it.
+     */
+    const uint32_t now_ms = AP_HAL::millis();
+    if (now_ms < T_STARTUP_MS) {
+        hal.scheduler->delay(T_STARTUP_MS - now_ms);
+    }
 
     /*
       take the part as we find it first. If it is already up and
