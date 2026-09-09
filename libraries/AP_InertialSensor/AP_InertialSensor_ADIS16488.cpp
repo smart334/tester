@@ -67,6 +67,8 @@
 // bits 0 to 5 are the gyro and accel start-up self test results
 # define DIAG_STS_INERTIAL_MASK 0x003F
 #define REG_TEMP_OUT        ADIS_REG(PAGE_OUTPUT, 0x0E)
+#define REG_X_GYRO_OUT      ADIS_REG(PAGE_OUTPUT, 0x12)
+#define REG_Z_ACCL_OUT      ADIS_REG(PAGE_OUTPUT, 0x26)
 #define REG_PROD_ID         ADIS_REG(PAGE_OUTPUT, 0x7E)
 # define PROD_ID_16488      0x4068
 
@@ -327,6 +329,30 @@ bool AP_InertialSensor_ADIS16488::init()
     ADIS_DEBUG("DIAG_STS 0x%04x SYS_E_FLAG 0x%04x", (unsigned)diag_sts, (unsigned)sys_e_flag);
     if ((diag_sts & DIAG_STS_INERTIAL_MASK) != 0) {
         report_failure("self test failed 0x%04x", (unsigned)diag_sts);
+        return false;
+    }
+
+    /*
+      Is the part actually converting?
+
+      A part held in reset, or short of supply, can still answer its
+      identity out of factory programmed memory while the rest of the
+      map reads as zero and nothing written to it sticks. From the
+      register map alone that is indistinguishable from a part that
+      simply refuses writes.
+
+      Page 0 carries live measurements, so this tells the two apart.
+      Lying still, the z accelerometer reads about a g and temperature
+      is only zero at exactly 25C, so all three of these reading zero
+      means the sensor is not running rather than not writing.
+     */
+    const uint16_t temp_raw = read_reg16(REG_TEMP_OUT);
+    const uint16_t gyro_raw = read_reg16(REG_X_GYRO_OUT);
+    const uint16_t accel_raw = read_reg16(REG_Z_ACCL_OUT);
+    ADIS_DEBUG("temp 0x%04x gx 0x%04x az 0x%04x",
+               (unsigned)temp_raw, (unsigned)gyro_raw, (unsigned)accel_raw);
+    if (temp_raw == 0 && gyro_raw == 0 && accel_raw == 0) {
+        report_failure("no data: check RST pin 8 and VDD");
         return false;
     }
 
