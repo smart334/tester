@@ -357,6 +357,15 @@ bool AP_InertialSensor_ADIS16488::init()
     }
 
     /*
+      Chip select has to frame the transfers for a write to commit, and
+      a part that stays selected reads perfectly while never committing
+      one, so establish that before reading anything into a failed
+      write.
+     */
+    const bool cs_framed = cs_frames_transfers();
+    ADIS_DEBUG("cs framing %s", cs_framed ? "ok" : "STUCK LOW");
+
+    /*
       Find a transfer shape whose writes land.
 
       Reads exercise neither the write bit nor the data byte, so a board
@@ -368,18 +377,19 @@ bool AP_InertialSensor_ADIS16488::init()
     bool write_ok = false;
     for (uint8_t pad = WRITE_PAD_NONE; pad <= WRITE_PAD_BOTH; pad++) {
         write_pad = write_pad_t(pad);
-        const bool bit_ok = write_bit_ok();
         write_ok = page_write_works();
-        (void)bit_ok;
-        ADIS_DEBUG("pad %u: bit %s write %s", (unsigned)pad,
-                   bit_ok ? "ok" : "LOST", write_ok ? "ok" : "LOST");
+        ADIS_DEBUG("pad %u write %s", (unsigned)pad, write_ok ? "ok" : "LOST");
         if (write_ok) {
             break;
         }
     }
     if (!write_ok) {
         write_pad = WRITE_PAD_NONE;
-        report_failure("no write shape reaches the part");
+        if (!cs_framed) {
+            report_failure("chip select stuck low, check CS wiring");
+        } else {
+            report_failure("no write shape reaches the part");
+        }
     }
 
 #if AP_INERTIALSENSOR_ADIS16488_DEBUG
@@ -537,30 +547,6 @@ bool AP_InertialSensor_ADIS16488::write_frame(uint8_t addr, uint8_t data) const
 }
 
 /*
-  check whether the write bit is reaching the part.
-
-  PROD_ID is read only, so writing to it does nothing whichever way the
-  command lands, but the two cases differ in what follows: a command
-  taken as a write leaves no pending read, while one whose write bit was
-  lost is a read of PROD_ID and puts 0x4068 on the next frame.
- */
-bool AP_InertialSensor_ADIS16488::write_bit_ok(void) const
-{
-    if (!write_frame(REG_ADDR(REG_PROD_ID), 0x00)) {
-        return false;
-    }
-    stall();
-
-    uint8_t next[2] { 0, 0 };
-    if (!dev->transfer_fullduplex(next, sizeof(next))) {
-        return false;
-    }
-    stall();
-
-    return ((next[0] << 8U) | next[1]) != PROD_ID_16488;
-}
-
-/*
   check whether a write actually changes a register, which needs the
   write bit, the address and the data byte all to arrive.
 
@@ -580,6 +566,44 @@ bool AP_InertialSensor_ADIS16488::page_write_works(void)
     current_page = PAGE_UNKNOWN;
 
     return ok;
+}
+
+/*
+  is chip select actually framing our transfers?
+
+  A part whose chip select never rises stays selected and counts SPI
+  clocks straight through, so it still decodes reads perfectly as long
+  as every transfer is a whole number of 16 bit frames, which ours all
+  are. Writes are what suffers: the part commits a write on the rising
+  edge of chip select, so with no edge nothing is ever committed. That
+  produces exactly what we see, a live sensor with working reads whose
+  registers never change.
+
+  Clock out a single byte, half a frame. With chip select framing, the
+  part sees an odd clock count, discards it, and the next assertion
+  starts a fresh frame, so its identity still reads. Stuck selected, the
+  stream is now offset by eight bits and the identity comes back as
+  something else, and a second odd byte puts the alignment back.
+ */
+bool AP_InertialSensor_ADIS16488::cs_frames_transfers(void)
+{
+    uint8_t odd[1] { 0 };
+    if (!dev->transfer_fullduplex(odd, sizeof(odd))) {
+        // could not run the test, do not claim a fault
+        return true;
+    }
+    stall();
+
+    const bool framed = read_reg16_raw(REG_ADDR(REG_PROD_ID)) == PROD_ID_16488;
+
+    if (!framed) {
+        // we have shifted a permanently selected part by half a frame,
+        // shift it back so the rest of the probe still works
+        dev->transfer_fullduplex(odd, sizeof(odd));
+        stall();
+    }
+
+    return framed;
 }
 
 /*

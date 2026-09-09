@@ -118,11 +118,11 @@ private:
     // send one write command frame
     bool write_frame(uint8_t addr, uint8_t data) const;
 
-    // check whether the write bit is reaching the part
-    bool write_bit_ok(void) const;
-
     // check whether a write actually changes a register
     bool page_write_works(void);
+
+    // check whether chip select is framing our transfers
+    bool cs_frames_transfers(void);
 
     // read a 16 bit register on whatever page is currently selected
     uint16_t read_reg16_raw(uint8_t addr) const;
