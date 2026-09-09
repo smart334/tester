@@ -331,31 +331,34 @@ bool AP_InertialSensor_ADIS16488::init()
 
 #if AP_INERTIALSENSOR_ADIS16488_DEBUG
     /*
-      Every read here goes through transfer_fullduplex() and every write
-      used to go through a send only transfer, so a part that answered
-      reads and ignored writes could equally have been a bus problem or
-      a HAL path problem. Drive the same page write down both paths and
-      report which one the part acted on. Both are sixteen clocks with
-      chip select held; only the HAL route differs.
+      Does the write bit reach the part at all?
+
+      Every read we do carries R/W = 0 and an address of 0x7E or below,
+      so bit 7 of the first byte, the write bit, has never once been
+      exercised by anything that worked, and neither has the data byte.
+      A part that answers reads perfectly and ignores every write looks
+      the same whether the command is arriving intact and being refused,
+      or arriving with the write bit stripped.
+
+      Send a write to PROD_ID and look at the following frame. PROD_ID
+      is read only, so the write itself does nothing either way, but the
+      two cases diverge in what comes next: a command received as a
+      write leaves no pending read and the next frame returns nothing,
+      while a command whose write bit was lost is a read of PROD_ID and
+      puts 0x4068 on DOUT.
      */
     {
-        uint8_t send_only[2] { PAGE_ID_ADDR | WRITE_FLAG, PAGE_CONTROL };
-        dev->transfer(send_only, sizeof(send_only), nullptr, 0);
+        uint8_t cmd[2] { REG_ADDR(REG_PROD_ID) | WRITE_FLAG, 0x00 };
+        dev->transfer_fullduplex(cmd, sizeof(cmd));
         stall();
-        const uint16_t after_send = read_reg16_raw(PAGE_ID_ADDR);
 
-        uint8_t full_duplex[2] { PAGE_ID_ADDR | WRITE_FLAG, PAGE_CONTROL };
-        dev->transfer_fullduplex(full_duplex, sizeof(full_duplex));
+        uint8_t next[2] { 0, 0 };
+        dev->transfer_fullduplex(next, sizeof(next));
         stall();
-        const uint16_t after_fdx = read_reg16_raw(PAGE_ID_ADDR);
 
-        ADIS_DEBUG("pg wr send 0x%04x fdx 0x%04x", (unsigned)after_send, (unsigned)after_fdx);
-
-        // leave the part where the rest of init expects to find it
-        uint8_t restore[2] { PAGE_ID_ADDR | WRITE_FLAG, PAGE_OUTPUT };
-        dev->transfer_fullduplex(restore, sizeof(restore));
-        stall();
-        current_page = PAGE_UNKNOWN;
+        const uint16_t echoed = (next[0] << 8U) | next[1];
+        ADIS_DEBUG("wr bit test 0x%04x %s", (unsigned)echoed,
+                   echoed == PROD_ID_16488 ? "LOST" : "ok");
     }
 
     /*
@@ -564,11 +567,10 @@ uint16_t AP_InertialSensor_ADIS16488::read_reg16(uint16_t reg)
 
   Writes go out through transfer_fullduplex() rather than a send only
   transfer. On the wire the two are the same, sixteen clocks with chip
-  select held, but they take different paths through the HAL, and on at
-  least one H743 board every send only write was ignored by the part
-  while every full duplex read worked. Reads never exercise the write
-  bit or the data byte, so that failure looked like a part that answered
-  reads and quietly dropped writes. The returned bytes are discarded.
+  select held, and driving both down one path was tried as a fix for a
+  part that ignored every write: it made no difference, so the two HAL
+  routes behave alike here. It is kept because it is the call the HAL
+  documents as preferred. The returned bytes are discarded.
  */
 bool AP_InertialSensor_ADIS16488::write_reg16(uint16_t reg, uint16_t value, bool confirm)
 {
