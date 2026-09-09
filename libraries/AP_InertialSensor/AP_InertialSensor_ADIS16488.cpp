@@ -182,6 +182,7 @@ AP_InertialSensor_ADIS16488::AP_InertialSensor_ADIS16488(AP_InertialSensor &imu,
     , drdy_pin(drdy_gpio)
     , current_page(PAGE_UNKNOWN)
     , stall_us(T_STALL_INIT_US)
+    , write_lead_in(false)
     , temp_sum(0)
     , temp_count(0)
 {
@@ -329,38 +330,35 @@ bool AP_InertialSensor_ADIS16488::init()
         return false;
     }
 
-#if AP_INERTIALSENSOR_ADIS16488_DEBUG
     /*
-      Does the write bit reach the part at all?
+      Does the write bit reach the part, and if not, can we get it there?
 
-      Every read we do carries R/W = 0 and an address of 0x7E or below,
-      so bit 7 of the first byte, the write bit, has never once been
-      exercised by anything that worked, and neither has the data byte.
-      A part that answers reads perfectly and ignores every write looks
-      the same whether the command is arriving intact and being refused,
-      or arriving with the write bit stripped.
-
-      Send a write to PROD_ID and look at the following frame. PROD_ID
-      is read only, so the write itself does nothing either way, but the
-      two cases diverge in what comes next: a command received as a
-      write leaves no pending read and the next frame returns nothing,
-      while a command whose write bit was lost is a read of PROD_ID and
-      puts 0x4068 on DOUT.
+      Every read carries a zero in the write bit and an address of 0x7E
+      or below, so nothing that works has ever put a one in that
+      position. On a board that loses it the part receives every write
+      as a read of the same address and does nothing, which looks in the
+      register map exactly like a part refusing to write. Establish
+      which we have, and if leading the write with a harmless frame
+      inside the same chip select window gets the bit through, use that
+      shape for every write from here on.
      */
-    {
-        uint8_t cmd[2] { REG_ADDR(REG_PROD_ID) | WRITE_FLAG, 0x00 };
-        dev->transfer_fullduplex(cmd, sizeof(cmd));
-        stall();
-
-        uint8_t next[2] { 0, 0 };
-        dev->transfer_fullduplex(next, sizeof(next));
-        stall();
-
-        const uint16_t echoed = (next[0] << 8U) | next[1];
-        ADIS_DEBUG("wr bit test 0x%04x %s", (unsigned)echoed,
-                   echoed == PROD_ID_16488 ? "LOST" : "ok");
+    write_lead_in = false;
+    bool write_ok = write_bit_ok();
+    if (!write_ok) {
+        write_lead_in = true;
+        write_ok = write_bit_ok();
+        if (!write_ok) {
+            // neither shape gets it through, keep the simpler one
+            write_lead_in = false;
+        }
+    }
+    ADIS_DEBUG("write bit %s%s", write_ok ? "ok" : "LOST",
+               write_lead_in ? " with lead-in" : "");
+    if (!write_ok) {
+        report_failure("write bit not reaching part");
     }
 
+#if AP_INERTIALSENSOR_ADIS16488_DEBUG
     /*
       Prove whether writes take effect at all before we depend on one.
       A scratch register on another page exercises the page switch and
@@ -478,6 +476,52 @@ void AP_InertialSensor_ADIS16488::report_failure(const char *fmt, ...) const
 }
 
 /*
+  send one write command frame.
+
+  On some boards the write bit does not survive being the first bit
+  clocked after chip select falls: the part then receives every write as
+  a read of the same address and quietly does nothing, while reads,
+  which always carry a zero there, work perfectly. Putting a harmless
+  read of PAGE_ID in front of the write inside the same chip select
+  window moves the write bit off the front of the transfer. The part
+  counts SPI clocks in groups of sixteen, so it sees the two frames the
+  same way it would see them separately.
+ */
+bool AP_InertialSensor_ADIS16488::write_frame(uint8_t addr, uint8_t data) const
+{
+    if (write_lead_in) {
+        uint8_t buf[4] { PAGE_ID_ADDR, 0, uint8_t(addr | WRITE_FLAG), data };
+        return dev->transfer_fullduplex(buf, sizeof(buf));
+    }
+    uint8_t buf[2] { uint8_t(addr | WRITE_FLAG), data };
+    return dev->transfer_fullduplex(buf, sizeof(buf));
+}
+
+/*
+  check whether the write bit is reaching the part.
+
+  PROD_ID is read only, so writing to it does nothing whichever way the
+  command lands, but the two cases differ in what follows: a command
+  taken as a write leaves no pending read, while one whose write bit was
+  lost is a read of PROD_ID and puts 0x4068 on the next frame.
+ */
+bool AP_InertialSensor_ADIS16488::write_bit_ok(void) const
+{
+    if (!write_frame(REG_ADDR(REG_PROD_ID), 0x00)) {
+        return false;
+    }
+    stall();
+
+    uint8_t next[2] { 0, 0 };
+    if (!dev->transfer_fullduplex(next, sizeof(next))) {
+        return false;
+    }
+    stall();
+
+    return ((next[0] << 8U) | next[1]) != PROD_ID_16488;
+}
+
+/*
   read a 16 bit register on whatever page is currently selected. This is
   the page agnostic half of read_reg16(), split out so that set_page()
   can confirm a page switch without recursing back into itself.
@@ -520,10 +564,8 @@ bool AP_InertialSensor_ADIS16488::set_page(uint8_t page)
     for (uint8_t i=0; i<PAGE_RETRIES; i++) {
         // PAGE_ID is the one register that takes a new value from a
         // write to its lower byte alone
-        uint8_t req[2] { PAGE_ID_ADDR | WRITE_FLAG, page };
-
         current_page = PAGE_UNKNOWN;
-        if (!dev->transfer_fullduplex(req, sizeof(req))) {
+        if (!write_frame(PAGE_ID_ADDR, page)) {
             continue;
         }
         stall();
@@ -583,15 +625,12 @@ bool AP_InertialSensor_ADIS16488::write_reg16(uint16_t reg, uint16_t value, bool
 
         // the lower byte goes first, a register takes its new value on
         // the write to the upper byte
-        uint8_t req[2] { uint8_t(addr | WRITE_FLAG), uint8_t(value & 0xFF) };
-        if (!dev->transfer_fullduplex(req, sizeof(req))) {
+        if (!write_frame(addr, uint8_t(value & 0xFF))) {
             continue;
         }
         stall();
 
-        req[0] = uint8_t((addr+1) | WRITE_FLAG);
-        req[1] = uint8_t(value >> 8);
-        if (!dev->transfer_fullduplex(req, sizeof(req))) {
+        if (!write_frame(addr+1, uint8_t(value >> 8))) {
             continue;
         }
         stall();
