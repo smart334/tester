@@ -102,6 +102,9 @@ private:
     // select the register page a register lives on
     bool set_page(uint8_t page);
 
+    // read a 16 bit register on whatever page is currently selected
+    uint16_t read_reg16_raw(uint8_t addr) const;
+
     // read a 16 bit register, given as ADIS_REG(page, address)
     uint16_t read_reg16(uint16_t reg);
 
@@ -116,6 +119,9 @@ private:
     // page currently selected on the sensor, PAGE_UNKNOWN when we have
     // not established it yet
     uint8_t current_page;
+
+    // gap held between two SPI frames, relaxed while configuring
+    uint8_t stall_us;
 
     // running temperature average, published to the frontend at 20Hz
     float temp_sum;

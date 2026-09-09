@@ -70,6 +70,13 @@
 # define PROD_ID_16488      0x4068
 
 /*
+  page 2, calibration. Only the user scratch registers are touched, and
+  only when debugging: they are read/write locations that affect nothing,
+  which makes them the right place to prove whether writes land at all.
+ */
+#define REG_USER_SCR_1      ADIS_REG(0x02, 0x74)
+
+/*
   page 3, control
  */
 #define REG_GLOB_CMD        ADIS_REG(PAGE_CONTROL, 0x02)
@@ -89,8 +96,14 @@
 /*
   timings
  */
-// minimum gap the sensor needs between two 16 bit frames
-#define T_STALL_US   2U
+/*
+  minimum gap the sensor needs between two 16 bit frames. The datasheet
+  gives 2us; the Linux driver for this family allows 5us, so use that
+  in the sample loop and a far more relaxed gap while configuring, where
+  a few extra microseconds per frame cost us nothing.
+ */
+#define T_STALL_US       5U
+#define T_STALL_INIT_US  20U
 
 /*
   the datasheet gives 500ms for both the power-on start-up time and the
@@ -101,6 +114,9 @@
 
 // how many reset-and-retry rounds we give the part before giving up
 #define PROBE_TRIES  5U
+
+// how many times we retry a page switch before calling it lost
+#define PAGE_RETRIES 5U
 
 /*
   the output stage always runs at 2460 SPS, and DEC_RATE decimates it
@@ -152,6 +168,7 @@ AP_InertialSensor_ADIS16488::AP_InertialSensor_ADIS16488(AP_InertialSensor &imu,
     , rotation(_rotation)
     , drdy_pin(drdy_gpio)
     , current_page(PAGE_UNKNOWN)
+    , stall_us(T_STALL_INIT_US)
     , temp_sum(0)
     , temp_count(0)
 {
@@ -285,6 +302,22 @@ bool AP_InertialSensor_ADIS16488::init()
         return false;
     }
 
+#if AP_INERTIALSENSOR_ADIS16488_DEBUG
+    /*
+      Prove whether writes take effect at all before we depend on one.
+      A scratch register on another page exercises the page switch and
+      the byte pair write without changing how the sensor behaves, and
+      the original value is put back afterwards. Writes only reach SRAM,
+      the flash copy is untouched without an explicit flash update.
+     */
+    {
+        const uint16_t saved = read_reg16(REG_USER_SCR_1);
+        write_reg16(REG_USER_SCR_1, 0xA5A5);
+        ADIS_DEBUG("scratch wrote 0xA5A5 read 0x%04x", (unsigned)read_reg16(REG_USER_SCR_1));
+        write_reg16(REG_USER_SCR_1, saved);
+    }
+#endif
+
     /*
       pick the decimation that lands closest to the rate we want. The
       register holds D-1, where the output rate is 2460/D.
@@ -324,11 +357,25 @@ bool AP_InertialSensor_ADIS16488::init()
 
     for (const auto &c : config) {
         if (!write_reg16(c.reg, c.value, true)) {
-            ADIS_ERROR("%s write failed, got 0x%04x", c.name, (unsigned)read_reg16(c.reg));
+            /*
+              Report enough to tell the three cases apart: the page we
+              actually ended up on, and whether the part saw a malformed
+              frame. SYS_E_FLAG bit 3 is its SPI communication error,
+              set when a transfer was not a multiple of 16 clocks.
+             */
+            const unsigned got = read_reg16(c.reg);
+            const unsigned page = read_reg16_raw(PAGE_ID_ADDR);
+            const unsigned sys_e = read_reg16(REG_SYS_E_FLAG);
+            ADIS_ERROR("%s write failed, got 0x%04x", c.name, got);
+            ADIS_ERROR("on page %u, SYS_E_FLAG 0x%04x", page, sys_e);
             return false;
         }
         ADIS_DEBUG("%s = 0x%04x", c.name, (unsigned)c.value);
     }
+
+    // configuration is done, tighten the inter frame gap back up for
+    // the sample loop, where it is paid 14 times per sample
+    stall_us = T_STALL_US;
 
     ADIS_DEBUG("ready at %u Hz", (unsigned)expected_sample_rate_hz);
 
@@ -348,45 +395,20 @@ bool AP_InertialSensor_ADIS16488::init()
 void AP_InertialSensor_ADIS16488::stall(void) const
 {
     const uint32_t tstart = AP_HAL::micros();
-    while (AP_HAL::micros() - tstart < T_STALL_US) {
+    while (AP_HAL::micros() - tstart < stall_us) {
     }
 }
 
 /*
-  select the page a register lives on
+  read a 16 bit register on whatever page is currently selected. This is
+  the page agnostic half of read_reg16(), split out so that set_page()
+  can confirm a page switch without recursing back into itself.
  */
-bool AP_InertialSensor_ADIS16488::set_page(uint8_t page)
+uint16_t AP_InertialSensor_ADIS16488::read_reg16_raw(uint8_t addr) const
 {
-    if (page == current_page) {
-        return true;
-    }
-
-    // PAGE_ID is the one register that takes a new value from a write
-    // to its lower byte alone
-    const uint8_t req[2] { PAGE_ID_ADDR | WRITE_FLAG, page };
-
-    current_page = PAGE_UNKNOWN;
-    if (!dev->transfer(req, sizeof(req), nullptr, 0)) {
-        return false;
-    }
-    stall();
-
-    current_page = page;
-    return true;
-}
-
-/*
-  read a 16 bit register value
- */
-uint16_t AP_InertialSensor_ADIS16488::read_reg16(uint16_t reg)
-{
-    if (!set_page(REG_PAGE(reg))) {
-        return 0;
-    }
-
     // the contents come back on the frame after the one carrying the
     // request, so this takes two frames
-    uint8_t frame[2] { REG_ADDR(reg), 0 };
+    uint8_t frame[2] { addr, 0 };
     if (!dev->transfer_fullduplex(frame, sizeof(frame))) {
         return 0;
     }
@@ -401,6 +423,52 @@ uint16_t AP_InertialSensor_ADIS16488::read_reg16(uint16_t reg)
     stall();
 
     return (frame[0] << 8U) | frame[1];
+}
+
+/*
+  select the page a register lives on.
+
+  Every other register access depends on this having taken effect, and
+  silently sitting on the wrong page would read and write the wrong
+  registers entirely, so confirm the switch by reading PAGE_ID back.
+ */
+bool AP_InertialSensor_ADIS16488::set_page(uint8_t page)
+{
+    if (page == current_page) {
+        return true;
+    }
+
+    for (uint8_t i=0; i<PAGE_RETRIES; i++) {
+        // PAGE_ID is the one register that takes a new value from a
+        // write to its lower byte alone
+        const uint8_t req[2] { PAGE_ID_ADDR | WRITE_FLAG, page };
+
+        current_page = PAGE_UNKNOWN;
+        if (!dev->transfer(req, sizeof(req), nullptr, 0)) {
+            continue;
+        }
+        stall();
+
+        // PAGE_ID appears at the same address on every page, so it can
+        // be read back without knowing where we ended up
+        if (read_reg16_raw(PAGE_ID_ADDR) == page) {
+            current_page = page;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*
+  read a 16 bit register value
+ */
+uint16_t AP_InertialSensor_ADIS16488::read_reg16(uint16_t reg)
+{
+    if (!set_page(REG_PAGE(reg))) {
+        return 0;
+    }
+    return read_reg16_raw(REG_ADDR(reg));
 }
 
 /*
