@@ -331,6 +331,34 @@ bool AP_InertialSensor_ADIS16488::init()
 
 #if AP_INERTIALSENSOR_ADIS16488_DEBUG
     /*
+      Every read here goes through transfer_fullduplex() and every write
+      used to go through a send only transfer, so a part that answered
+      reads and ignored writes could equally have been a bus problem or
+      a HAL path problem. Drive the same page write down both paths and
+      report which one the part acted on. Both are sixteen clocks with
+      chip select held; only the HAL route differs.
+     */
+    {
+        uint8_t send_only[2] { PAGE_ID_ADDR | WRITE_FLAG, PAGE_CONTROL };
+        dev->transfer(send_only, sizeof(send_only), nullptr, 0);
+        stall();
+        const uint16_t after_send = read_reg16_raw(PAGE_ID_ADDR);
+
+        uint8_t full_duplex[2] { PAGE_ID_ADDR | WRITE_FLAG, PAGE_CONTROL };
+        dev->transfer_fullduplex(full_duplex, sizeof(full_duplex));
+        stall();
+        const uint16_t after_fdx = read_reg16_raw(PAGE_ID_ADDR);
+
+        ADIS_DEBUG("pg wr send 0x%04x fdx 0x%04x", (unsigned)after_send, (unsigned)after_fdx);
+
+        // leave the part where the rest of init expects to find it
+        uint8_t restore[2] { PAGE_ID_ADDR | WRITE_FLAG, PAGE_OUTPUT };
+        dev->transfer_fullduplex(restore, sizeof(restore));
+        stall();
+        current_page = PAGE_UNKNOWN;
+    }
+
+    /*
       Prove whether writes take effect at all before we depend on one.
       A scratch register on another page exercises the page switch and
       the byte pair write without changing how the sensor behaves, and
@@ -489,10 +517,10 @@ bool AP_InertialSensor_ADIS16488::set_page(uint8_t page)
     for (uint8_t i=0; i<PAGE_RETRIES; i++) {
         // PAGE_ID is the one register that takes a new value from a
         // write to its lower byte alone
-        const uint8_t req[2] { PAGE_ID_ADDR | WRITE_FLAG, page };
+        uint8_t req[2] { PAGE_ID_ADDR | WRITE_FLAG, page };
 
         current_page = PAGE_UNKNOWN;
-        if (!dev->transfer(req, sizeof(req), nullptr, 0)) {
+        if (!dev->transfer_fullduplex(req, sizeof(req))) {
             continue;
         }
         stall();
@@ -532,7 +560,15 @@ uint16_t AP_InertialSensor_ADIS16488::read_reg16(uint16_t reg)
 }
 
 /*
-  write a 16 bit register value
+  write a 16 bit register value.
+
+  Writes go out through transfer_fullduplex() rather than a send only
+  transfer. On the wire the two are the same, sixteen clocks with chip
+  select held, but they take different paths through the HAL, and on at
+  least one H743 board every send only write was ignored by the part
+  while every full duplex read worked. Reads never exercise the write
+  bit or the data byte, so that failure looked like a part that answered
+  reads and quietly dropped writes. The returned bytes are discarded.
  */
 bool AP_InertialSensor_ADIS16488::write_reg16(uint16_t reg, uint16_t value, bool confirm)
 {
@@ -546,14 +582,14 @@ bool AP_InertialSensor_ADIS16488::write_reg16(uint16_t reg, uint16_t value, bool
         // the lower byte goes first, a register takes its new value on
         // the write to the upper byte
         uint8_t req[2] { uint8_t(addr | WRITE_FLAG), uint8_t(value & 0xFF) };
-        if (!dev->transfer(req, sizeof(req), nullptr, 0)) {
+        if (!dev->transfer_fullduplex(req, sizeof(req))) {
             continue;
         }
         stall();
 
         req[0] = uint8_t((addr+1) | WRITE_FLAG);
         req[1] = uint8_t(value >> 8);
-        if (!dev->transfer(req, sizeof(req), nullptr, 0)) {
+        if (!dev->transfer_fullduplex(req, sizeof(req))) {
             continue;
         }
         stall();
