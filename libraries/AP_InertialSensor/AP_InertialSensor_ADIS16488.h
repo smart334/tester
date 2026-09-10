@@ -93,6 +93,16 @@ private:
      */
     bool init();
     bool check_product_id(uint16_t &id);
+
+    // fetch one raw sample block over SPI, without publishing it
+    bool fetch_sample(uint16_t *vals);
+
+    // time what a sample actually costs on this bus
+    uint32_t measure_sample_cost_us(void);
+
+    // settle on an output rate the bus can sustain
+    void choose_rate(uint32_t wanted_hz, uint32_t &decimation);
+
     void read_sensor(void);
     void loop(void);
 

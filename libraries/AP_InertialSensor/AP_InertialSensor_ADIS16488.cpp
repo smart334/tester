@@ -126,6 +126,12 @@
 #define PAGE_RETRIES 5U
 
 /*
+  the sample thread runs above the main loop, so it has to yield on
+  every pass even when it is already behind, or nothing below it runs
+ */
+#define MIN_YIELD_US 100U
+
+/*
   how many times a probe failure is repeated to the ground station.
   Statustext raised during init is dropped outright, not queued, once
   the streaming channel mask has been worked out but no link is
@@ -393,13 +399,14 @@ bool AP_InertialSensor_ADIS16488::init()
 
 #if AP_INERTIALSENSOR_ADIS16488_READ_ONLY
     /*
-      Take the factory defaults and read. DEC_RATE defaults to zero, so
-      the part is running undecimated at its full rate, and that is the
-      rate the frontend has to be told about.
+      DEC_RATE defaults to zero, so the part runs undecimated at its
+      full rate and we cannot change that without writing. We do not
+      have to read every sample of it though: take a rate the bus can
+      actually keep and sub-sample, and report that rate rather than the
+      part's, because the frontend sizes its filters from what we say.
      */
-    expected_sample_rate_hz = INTERNAL_RATE_HZ;
-    period_us = (1000000UL / INTERNAL_RATE_HZ) - 20U;
-    temp_publish_count = MAX(1U, INTERNAL_RATE_HZ / TEMP_PUBLISH_HZ);
+    uint32_t d = 1;
+    choose_rate(INTERNAL_RATE_HZ, d);
 
     GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ADIS16488: read only, config not verified");
 #else
@@ -459,15 +466,8 @@ bool AP_InertialSensor_ADIS16488::init()
       pick the decimation that lands closest to the rate we want. The
       register holds D-1, where the output rate is 2460/D.
      */
-    const uint32_t rate_req = constrain_uint32(AP_INERTIALSENSOR_ADIS16488_RATE_HZ, 2U, INTERNAL_RATE_HZ);
-    const uint32_t d = constrain_uint32((INTERNAL_RATE_HZ + rate_req/2) / rate_req, 1U, MAX_DEC_RATE);
-
-    expected_sample_rate_hz = float(INTERNAL_RATE_HZ) / d;
-
-    // we deliberately set the period a bit fast to ensure we don't lose a sample
-    period_us = (1000000UL * d) / INTERNAL_RATE_HZ - 20U;
-
-    temp_publish_count = MAX(1U, uint32_t(expected_sample_rate_hz) / TEMP_PUBLISH_HZ);
+    uint32_t d = 1;
+    choose_rate(AP_INERTIALSENSOR_ADIS16488_RATE_HZ, d);
 
     /*
       pulse data ready high on the DIOx line the board is wired to.
@@ -510,13 +510,13 @@ bool AP_InertialSensor_ADIS16488::init()
         ADIS_DEBUG("%s = 0x%04x", c.name, (unsigned)c.value);
     }
 
+#endif  // AP_INERTIALSENSOR_ADIS16488_READ_ONLY
+
     // configuration is done, tighten the inter frame gap back up for
     // the sample loop, where it is paid 14 times per sample
     stall_us = T_STALL_US;
 
     ADIS_DEBUG("ready at %u Hz", (unsigned)expected_sample_rate_hz);
-
-#endif  // AP_INERTIALSENSOR_ADIS16488_READ_ONLY
 
     /*
       frames are only 16 bits each and we need a lot of them per
@@ -786,40 +786,111 @@ bool AP_InertialSensor_ADIS16488::write_reg16(uint16_t reg, uint16_t value, bool
 }
 
 /*
+  fetch one raw sample block over SPI, without publishing it
+ */
+bool AP_InertialSensor_ADIS16488::fetch_sample(uint16_t *vals)
+{
+    WITH_SEMAPHORE(dev->get_semaphore());
+
+    if (!set_page(PAGE_OUTPUT)) {
+        return false;
+    }
+
+    /*
+      the sensor answers a read on the frame after the one carrying
+      the request, so a run of NUM_DATA_REGS+1 frames fetches the
+      whole block: each frame asks for the next register while
+      returning the contents of the previous request.
+     */
+    for (uint8_t i=0; i<=NUM_DATA_REGS; i++) {
+        // a zero address on the last frame is a read of PAGE_ID,
+        // which costs us nothing
+        uint8_t frame[2] { 0, 0 };
+        if (i < NUM_DATA_REGS) {
+            frame[0] = REG_ADDR(REG_TEMP_OUT) + i*2;
+        }
+        if (!dev->transfer_fullduplex(frame, sizeof(frame))) {
+            return false;
+        }
+        if (i > 0) {
+            vals[i-1] = (frame[0] << 8U) | frame[1];
+        }
+        stall();
+    }
+
+    return true;
+}
+
+/*
+  time what a sample actually costs on this bus.
+
+  With no burst mode a sample is fourteen separate SPI frames, so it
+  costs far more than it would on a part that has one, and how much more
+  depends on the bus speed and on the HAL underneath. Measure it rather
+  than assume: the rate we claim has to be a rate we can keep.
+ */
+uint32_t AP_InertialSensor_ADIS16488::measure_sample_cost_us(void)
+{
+    uint16_t vals[NUM_DATA_REGS];
+    const uint8_t rounds = 8;
+
+    // one throwaway pass so any first time cost is not counted
+    fetch_sample(vals);
+
+    const uint32_t tstart = AP_HAL::micros();
+    for (uint8_t i=0; i<rounds; i++) {
+        fetch_sample(vals);
+    }
+    return (AP_HAL::micros() - tstart) / rounds;
+}
+
+/*
+  settle on an output rate the bus can sustain.
+
+  Claiming a rate we cannot keep is worse than claiming a slower one.
+  The frontend sizes its filters from what we report, so a driver that
+  claims 2460Hz and delivers a fraction of that turns a 20Hz gyro filter
+  into a fraction of a Hz, which is felt as lag rather than seen as a
+  wrong rate. Leave half the budget for everything else and take the
+  slower of what was wanted and what fits.
+ */
+void AP_InertialSensor_ADIS16488::choose_rate(uint32_t wanted_hz, uint32_t &decimation)
+{
+    // measure at the gap the sample loop will use, not the relaxed one
+    // configuration runs at
+    const uint8_t saved_stall = stall_us;
+    stall_us = T_STALL_US;
+    const uint32_t cost_us = MAX(measure_sample_cost_us(), 1U);
+    stall_us = saved_stall;
+
+    const uint32_t affordable_hz = MAX(1000000UL / (cost_us * 2), 1U);
+    const uint32_t rate_hz = MAX(MIN(wanted_hz, affordable_hz), 1U);
+
+    /*
+      The part decimates by whole steps, so round to one it can produce,
+      and round towards the slower step: rounding to nearest can land on
+      a rate above what we just worked out we can afford.
+     */
+    decimation = constrain_uint32((INTERNAL_RATE_HZ + rate_hz - 1) / rate_hz, 1U, MAX_DEC_RATE);
+
+    expected_sample_rate_hz = float(INTERNAL_RATE_HZ) / decimation;
+    period_us = (1000000UL * decimation) / INTERNAL_RATE_HZ;
+    temp_publish_count = MAX(1U, uint32_t(expected_sample_rate_hz) / TEMP_PUBLISH_HZ);
+
+    ADIS_DEBUG("sample %uus, %u/%uHz -> %uHz", (unsigned)cost_us,
+               (unsigned)wanted_hz, (unsigned)affordable_hz,
+               (unsigned)expected_sample_rate_hz);
+}
+
+/*
   read one sample of temperature, gyro and accel data
  */
 void AP_InertialSensor_ADIS16488::read_sensor(void)
 {
     uint16_t vals[NUM_DATA_REGS];
 
-    {
-        WITH_SEMAPHORE(dev->get_semaphore());
-
-        if (!set_page(PAGE_OUTPUT)) {
-            return;
-        }
-
-        /*
-          the sensor answers a read on the frame after the one carrying
-          the request, so a run of NUM_DATA_REGS+1 frames fetches the
-          whole block: each frame asks for the next register while
-          returning the contents of the previous request.
-         */
-        for (uint8_t i=0; i<=NUM_DATA_REGS; i++) {
-            // a zero address on the last frame is a read of PAGE_ID,
-            // which costs us nothing
-            uint8_t frame[2] { 0, 0 };
-            if (i < NUM_DATA_REGS) {
-                frame[0] = REG_ADDR(REG_TEMP_OUT) + i*2;
-            }
-            if (!dev->transfer_fullduplex(frame, sizeof(frame))) {
-                return;
-            }
-            if (i > 0) {
-                vals[i-1] = (frame[0] << 8U) | frame[1];
-            }
-            stall();
-        }
+    if (!fetch_sample(vals)) {
+        return;
     }
 
     /*
@@ -873,13 +944,29 @@ void AP_InertialSensor_ADIS16488::loop(void)
             wait_ok = hal.gpio->wait_pin(drdy_pin, AP_HAL::GPIO::INTERRUPT_RISING, drdy_timeout_us);
         }
         read_sensor();
+
+        /*
+          Always yield, even when the sample took longer than its period.
+
+          This thread runs at boosted priority and a sample is fourteen
+          SPI frames, so a period the bus cannot meet used to leave it
+          running flat out with nothing below it ever scheduled. The
+          rate is chosen from a measurement now, so being late should be
+          rare, but never sleeping is the kind of failure that shows up
+          as the whole vehicle feeling slow rather than as anything
+          obviously wrong with the IMU.
+         */
         const uint32_t dt = AP_HAL::micros() - tstart;
+        uint32_t wait_us = MIN_YIELD_US;
         if (dt < period_us) {
-            const uint32_t wait_us = period_us - dt;
-            if (!wait_ok || wait_us > period_us/2) {
-                hal.scheduler->delay_microseconds(wait_us);
+            const uint32_t remaining = period_us - dt;
+            // when the data ready line is pacing us there is no point
+            // sleeping past the next edge
+            if (!wait_ok || remaining > period_us/2) {
+                wait_us = MAX(remaining, MIN_YIELD_US);
             }
         }
+        hal.scheduler->delay_microseconds(wait_us);
     }
 }
 
