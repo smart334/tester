@@ -856,12 +856,22 @@ uint32_t AP_InertialSensor_ADIS16488::measure_sample_cost_us(void)
  */
 void AP_InertialSensor_ADIS16488::choose_rate(uint32_t wanted_hz, uint32_t &decimation)
 {
-    // measure at the gap the sample loop will use, not the relaxed one
-    // configuration runs at
+    /*
+      Measure under the conditions the sample loop will really run in,
+      not the ones configuration runs in. That means the bus speed the
+      loop uses rather than the cautious one the probe starts at, and
+      the tight inter frame gap rather than the relaxed one. Timing a
+      sample at the wrong speed would have us pick a rate for a cost we
+      never actually pay.
+     */
     const uint8_t saved_stall = stall_us;
     stall_us = T_STALL_US;
+    dev->set_speed(AP_HAL::Device::SPEED_HIGH);
+
     const uint32_t cost_us = MAX(measure_sample_cost_us(), 1U);
+
     stall_us = saved_stall;
+    dev->set_speed(AP_HAL::Device::SPEED_LOW);
 
     const uint32_t affordable_hz = MAX(1000000UL / (cost_us * 2), 1U);
     const uint32_t rate_hz = MAX(MIN(wanted_hz, affordable_hz), 1U);
