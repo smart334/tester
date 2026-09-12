@@ -701,6 +701,12 @@ const AP_Param::GroupInfo AP_InertialSensor::var_info[] = {
 
     // indexes 57 and 58 used by INS_HNTC3 and INS_HNTC4
 
+#if AP_INERTIALSENSOR_RAW_SAMPLE_LOGGER_ENABLED
+    // @Group: _RLOG_
+    // @Path: AP_InertialSensor_RawSampleLogger.cpp
+    AP_SUBGROUPINFO(rawsamplelogger, "_RLOG_", 59, AP_InertialSensor, AP_InertialSensor_RawSampleLogger),
+#endif
+
     /*
       NOTE: parameter indexes have gaps above. When adding new
       parameters check for conflicts carefully
@@ -983,6 +989,11 @@ AP_InertialSensor::init(uint16_t loop_rate)
 #if AP_INERTIALSENSOR_BATCHSAMPLER_ENABLED
     // initialise IMU batch logging
     batchsampler.init();
+#endif
+
+#if AP_INERTIALSENSOR_RAW_SAMPLE_LOGGER_ENABLED
+    // start the thread that writes raw samples to the SD card
+    rawsamplelogger.init();
 #endif
 
 #if HAL_GYROFFT_ENABLED
@@ -1328,6 +1339,9 @@ void AP_InertialSensor::periodic()
 {
 #if AP_INERTIALSENSOR_BATCHSAMPLER_ENABLED
     batchsampler.periodic();
+#endif
+#if AP_INERTIALSENSOR_RAW_SAMPLE_LOGGER_ENABLED
+    rawsamplelogger.periodic();
 #endif
 }
 

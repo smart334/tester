@@ -34,6 +34,7 @@
 #define DEFAULT_IMU_LOG_BAT_MASK 0
 
 #include "AP_InertialSensor_config.h"
+#include "AP_InertialSensor_RawSampleLogger.h"
 
 #if AP_INERTIALSENSOR_HARMONICNOTCH_ENABLED
 #ifndef HAL_INS_NUM_HARMONIC_NOTCH_FILTERS
@@ -480,6 +481,11 @@ public:
         const AP_InertialSensor &_imu;
     };
     BatchSampler batchsampler{*this};
+#endif
+
+#if AP_INERTIALSENSOR_RAW_SAMPLE_LOGGER_ENABLED
+    // continuous raw sample capture to a CSV file on the SD card
+    AP_InertialSensor_RawSampleLogger rawsamplelogger;
 #endif
 
 #if AP_EXTERNAL_AHRS_ENABLED

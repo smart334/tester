@@ -1,6 +1,7 @@
 #pragma once
 
 #include <AP_HAL/AP_HAL_Boards.h>
+#include <AP_Filesystem/AP_Filesystem_config.h>
 #include <AP_Logger/AP_Logger_config.h>
 
 /**
@@ -36,6 +37,13 @@
 
 #ifndef AP_INERTIALSENSOR_KILL_IMU_ENABLED
 #define AP_INERTIALSENSOR_KILL_IMU_ENABLED 1
+#endif
+
+// continuous logging of raw (pre-filter) IMU samples to a CSV file on
+// the SD card.  Needs a writable filesystem and a reasonable amount of
+// flash, so it is off on smaller boards:
+#ifndef AP_INERTIALSENSOR_RAW_SAMPLE_LOGGER_ENABLED
+#define AP_INERTIALSENSOR_RAW_SAMPLE_LOGGER_ENABLED (AP_INERTIALSENSOR_ENABLED && AP_FILESYSTEM_FILE_WRITING_ENABLED && HAL_PROGRAM_SIZE_LIMIT_KB > 1024)
 #endif
 
 #ifndef AP_INERTIALSENSOR_BACKEND_DEFAULT_ENABLED
