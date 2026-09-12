@@ -158,6 +158,9 @@ private:
     // padding used around every write command
     write_pad_t write_pad;
 
+    // counts samples between accel reports when debugging
+    uint32_t accel_report_count;
+
     // running temperature average, published to the frontend at 20Hz
     float temp_sum;
     uint16_t temp_count;

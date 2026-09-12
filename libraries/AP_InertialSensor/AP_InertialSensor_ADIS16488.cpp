@@ -194,6 +194,9 @@
 // rate at which we hand an averaged temperature to the frontend
 #define TEMP_PUBLISH_HZ 20U
 
+// seconds between accelerometer reports when debugging
+#define ACCEL_REPORT_SEC 2U
+
 extern const AP_HAL::HAL& hal;
 
 /*
@@ -215,6 +218,7 @@ AP_InertialSensor_ADIS16488::AP_InertialSensor_ADIS16488(AP_InertialSensor &imu,
     , current_page(PAGE_UNKNOWN)
     , stall_us(T_STALL_INIT_US)
     , write_pad(WRITE_PAD_NONE)
+    , accel_report_count(0)
     , temp_sum(0)
     , temp_count(0)
 {
@@ -917,6 +921,30 @@ void AP_InertialSensor_ADIS16488::read_sensor(void)
 
     gyro *= gyro_scale;
     accel *= accel_scale;
+
+#if AP_INERTIALSENSOR_ADIS16488_DEBUG
+    /*
+      Report the accelerometer as raw counts and as a vector magnitude.
+
+      Gravity is 9.8 whichever way the board is lying, so the magnitude
+      is what separates a scaling problem from a tilted bench: one that
+      holds near 9.8 while a single axis reads low is only orientation,
+      one that sits low in every orientation is the scale. 1250 counts
+      is a g, so a level axis should read about that.
+
+      This is the raw conversion, before the frontend's offsets and
+      scale factors are applied, so a failed calibration cannot colour
+      the numbers.
+     */
+    if (++accel_report_count >= uint32_t(expected_sample_rate_hz) * ACCEL_REPORT_SEC) {
+        accel_report_count = 0;
+        ADIS_DEBUG("a %d %d %d cnt |a| %.2f m/s2",
+                   int(combine32(vals[IDX_AX_HIGH], vals[IDX_AX_LOW]) / 65536),
+                   int(combine32(vals[IDX_AY_HIGH], vals[IDX_AY_LOW]) / 65536),
+                   int(combine32(vals[IDX_AZ_HIGH], vals[IDX_AZ_LOW]) / 65536),
+                   double(accel.length()));
+    }
+#endif
 
     _rotate_and_correct_accel(accel_instance, accel);
     _notify_new_accel_raw_sample(accel_instance, accel);
