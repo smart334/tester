@@ -40,6 +40,14 @@
 #define ADIS_ERROR(fmt, args ...) GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "ADIS16488: " fmt, ##args)
 
 /*
+  set to 0 to leave a part that is carrying a user calibration alone and
+  only report it, rather than dividing its gain back out.
+ */
+#ifndef AP_INERTIALSENSOR_ADIS16488_UNDO_USER_CAL
+#define AP_INERTIALSENSOR_ADIS16488_UNDO_USER_CAL 1
+#endif
+
+/*
   registers are identified by the page they live on as well as their
   address, as the whole map is 13 pages of 64 sixteen bit registers
  */
@@ -73,11 +81,36 @@
 # define PROD_ID_16488      0x4068
 
 /*
-  page 2, calibration. Only the user scratch registers are touched, and
-  only when debugging: they are read/write locations that affect nothing,
-  which makes them the right place to prove whether writes land at all.
+  page 2, user calibration.
+
+  The part applies these to every sample before we ever see it:
+
+      out = (measured + x_BIAS) * (1 + x_SCALE/32768)
+
+  All of them default to zero, which is no bias and unity gain, but they
+  are held in flash and reloaded on every reset, so a part that has been
+  on someone else's bench arrives still trimmed to it.
+
+  The scratch registers at the top of the page are read/write locations
+  that affect nothing, which makes them the right place to prove whether
+  writes land at all.
  */
-#define REG_USER_SCR_1      ADIS_REG(0x02, 0x74)
+#define PAGE_CAL            0x02
+#define REG_X_GYRO_SCALE    ADIS_REG(PAGE_CAL, 0x04)
+#define REG_Y_GYRO_SCALE    ADIS_REG(PAGE_CAL, 0x06)
+#define REG_Z_GYRO_SCALE    ADIS_REG(PAGE_CAL, 0x08)
+#define REG_X_ACCL_SCALE    ADIS_REG(PAGE_CAL, 0x0A)
+#define REG_Y_ACCL_SCALE    ADIS_REG(PAGE_CAL, 0x0C)
+#define REG_Z_ACCL_SCALE    ADIS_REG(PAGE_CAL, 0x0E)
+#define REG_XG_BIAS_HIGH    ADIS_REG(PAGE_CAL, 0x12)
+#define REG_YG_BIAS_HIGH    ADIS_REG(PAGE_CAL, 0x16)
+#define REG_ZG_BIAS_HIGH    ADIS_REG(PAGE_CAL, 0x1A)
+#define REG_XA_BIAS_HIGH    ADIS_REG(PAGE_CAL, 0x1E)
+#define REG_YA_BIAS_HIGH    ADIS_REG(PAGE_CAL, 0x22)
+#define REG_ZA_BIAS_HIGH    ADIS_REG(PAGE_CAL, 0x26)
+// one LSB of a scale register is 1/32768 of the measurement
+#define SCALE_REG_LSB       (1.0f/32768.0f)
+#define REG_USER_SCR_1      ADIS_REG(PAGE_CAL, 0x74)
 
 /*
   page 3, control
@@ -287,11 +320,114 @@ bool AP_InertialSensor_ADIS16488::check_product_id(uint16_t &id)
       LSB for the gyros and 0.8mg per LSB for the accels, so a full 32
       bit sample is 1/65536 of that.
      */
-    gyro_scale = radians(0.02) / 65536.0;
-    accel_scale = (0.8e-3 * GRAVITY_MSS) / 65536.0;
+    const float gyro_lsb = radians(0.02) / 65536.0;
+    const float accel_lsb = (0.8e-3 * GRAVITY_MSS) / 65536.0;
+    gyro_scale = Vector3f{gyro_lsb, gyro_lsb, gyro_lsb};
+    accel_scale = Vector3f{accel_lsb, accel_lsb, accel_lsb};
 
     // the accels are a +/-18g part
     _clip_limit = (18.0f - 0.5f) * GRAVITY_MSS;
+
+    return true;
+}
+
+/*
+  Find out whether the part is applying a calibration of its own.
+
+  The ADIS16488 trims every sample before it reaches us, using bias and
+  gain registers on page 2 that default to no bias and unity gain but
+  survive in flash across a reset. A gain left in there by whoever had
+  the part before is indistinguishable, from page 0 alone, from this
+  driver using the wrong scale factor.
+
+  It matters which it is, because ArduPilot cannot paper over a gain:
+  the accelerometer calibration refuses any scale correction beyond 20%
+  (AccelCalibrator::accept_result), so a part reporting 20% low leaves
+  the vehicle with no way to calibrate at all.
+
+  Reading twelve registers once at startup tells the two apart, and
+  costs nothing on a part holding the defaults.
+ */
+bool AP_InertialSensor_ADIS16488::check_user_calibration(void)
+{
+    /*
+      Page 2 answers with page 2's registers only if the part really
+      moved there, and set_page carries on when its read back will not
+      settle. Reading page 0 as though it were page 2 would invent a
+      calibration that is not there, so confirm the switch landed.
+     */
+    if (!set_page(PAGE_CAL) || (read_reg16_raw(PAGE_ID_ADDR) & 0xFF) != PAGE_CAL) {
+        // leave the page unknown so the next access selects it again
+        current_page = PAGE_UNKNOWN;
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ADIS16488: cal page unreachable");
+        return false;
+    }
+
+    const uint16_t accel_gain_reg[3] = { read_reg16(REG_X_ACCL_SCALE),
+                                         read_reg16(REG_Y_ACCL_SCALE),
+                                         read_reg16(REG_Z_ACCL_SCALE) };
+    const uint16_t gyro_gain_reg[3]  = { read_reg16(REG_X_GYRO_SCALE),
+                                         read_reg16(REG_Y_GYRO_SCALE),
+                                         read_reg16(REG_Z_GYRO_SCALE) };
+    const uint16_t accel_bias_reg[3] = { read_reg16(REG_XA_BIAS_HIGH),
+                                         read_reg16(REG_YA_BIAS_HIGH),
+                                         read_reg16(REG_ZA_BIAS_HIGH) };
+    const uint16_t gyro_bias_reg[3]  = { read_reg16(REG_XG_BIAS_HIGH),
+                                         read_reg16(REG_YG_BIAS_HIGH),
+                                         read_reg16(REG_ZG_BIAS_HIGH) };
+
+    uint16_t any = 0;
+    for (uint8_t i=0; i<3; i++) {
+        any |= accel_gain_reg[i] | gyro_gain_reg[i] |
+               accel_bias_reg[i] | gyro_bias_reg[i];
+    }
+
+    if (any == 0) {
+        // factory defaults, the part is reporting what it measured
+        ADIS_DEBUG("user cal clean");
+        return true;
+    }
+
+    /*
+      Report before correcting. These are warnings rather than debug
+      output because a part that is not at its defaults explains a whole
+      class of wrong readings, and the person flying it should see that
+      whether or not the driver was built to talk.
+     */
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ADIS16488: acl sc %04x %04x %04x",
+                  (unsigned)accel_gain_reg[0], (unsigned)accel_gain_reg[1],
+                  (unsigned)accel_gain_reg[2]);
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ADIS16488: acl bi %04x %04x %04x",
+                  (unsigned)accel_bias_reg[0], (unsigned)accel_bias_reg[1],
+                  (unsigned)accel_bias_reg[2]);
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ADIS16488: gyr sc %04x %04x %04x",
+                  (unsigned)gyro_gain_reg[0], (unsigned)gyro_gain_reg[1],
+                  (unsigned)gyro_gain_reg[2]);
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ADIS16488: gyr bi %04x %04x %04x",
+                  (unsigned)gyro_bias_reg[0], (unsigned)gyro_bias_reg[1],
+                  (unsigned)gyro_bias_reg[2]);
+
+#if AP_INERTIALSENSOR_ADIS16488_UNDO_USER_CAL
+    /*
+      Divide the gain back out so we publish what the sensor measured.
+
+      The bias terms are left alone: an offset is what ArduPilot's own
+      calibration is for, and it absorbs one without complaint, whereas
+      a gain it cannot. A register at or past full scale would divide by
+      something at or below zero, so only sane gains are undone.
+     */
+    for (uint8_t i=0; i<3; i++) {
+        const float accel_gain = 1.0f + int16_t(accel_gain_reg[i]) * SCALE_REG_LSB;
+        const float gyro_gain  = 1.0f + int16_t(gyro_gain_reg[i]) * SCALE_REG_LSB;
+        if (accel_gain > 0.5f && accel_gain < 2.0f) {
+            accel_scale[i] /= accel_gain;
+        }
+        if (gyro_gain > 0.5f && gyro_gain < 2.0f) {
+            gyro_scale[i] /= gyro_gain;
+        }
+    }
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ADIS16488: undoing part's own gain");
+#endif
 
     return true;
 }
@@ -400,6 +536,15 @@ bool AP_InertialSensor_ADIS16488::init()
         report_failure("no data: check RST pin 8 and VDD");
         return false;
     }
+
+    /*
+      The part may be trimming its own output. That has to be known
+      before the scale factors are trusted, and it is only a page
+      select and a dozen reads, so it is worth doing even on a board
+      whose writes do not land: the page select is the only write and
+      a failed one is reported rather than believed.
+     */
+    check_user_calibration();
 
 #if AP_INERTIALSENSOR_ADIS16488_READ_ONLY
     /*
@@ -919,8 +1064,17 @@ void AP_InertialSensor_ADIS16488::read_sensor(void)
                    float(combine32(vals[IDX_AY_HIGH], vals[IDX_AY_LOW])),
                    float(combine32(vals[IDX_AZ_HIGH], vals[IDX_AZ_LOW]))};
 
-    gyro *= gyro_scale;
-    accel *= accel_scale;
+    /*
+      applied per axis, as the scale carries any correction for a user
+      calibration the part is running on itself. Multiplying two
+      Vector3f gives the dot product, so this cannot be one operator.
+     */
+    gyro.x *= gyro_scale.x;
+    gyro.y *= gyro_scale.y;
+    gyro.z *= gyro_scale.z;
+    accel.x *= accel_scale.x;
+    accel.y *= accel_scale.y;
+    accel.z *= accel_scale.z;
 
 #if AP_INERTIALSENSOR_ADIS16488_DEBUG
     /*

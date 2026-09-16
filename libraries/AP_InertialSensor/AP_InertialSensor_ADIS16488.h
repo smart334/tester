@@ -94,6 +94,9 @@ private:
     bool init();
     bool check_product_id(uint16_t &id);
 
+    // read back any calibration the part is applying to its own output
+    bool check_user_calibration(void);
+
     // fetch one raw sample block over SPI, without publishing it
     bool fetch_sample(uint16_t *vals);
 
@@ -169,6 +172,11 @@ private:
     float expected_sample_rate_hz;
     uint32_t period_us;
 
-    float accel_scale;
-    float gyro_scale;
+    /*
+      metres/sec/sec and radians/sec per LSB of a 32 bit sample, held
+      per axis because a part carrying a user calibration needs that
+      calibration divided back out one axis at a time
+     */
+    Vector3f accel_scale;
+    Vector3f gyro_scale;
 };
