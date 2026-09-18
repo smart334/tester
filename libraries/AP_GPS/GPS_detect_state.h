@@ -49,6 +49,14 @@ struct UBLOX_detect_state {
 };
 #endif
 
+#if AP_GPS_UBLOX_PASSIVE_ENABLED
+struct UBLOX_PASSIVE_detect_state {
+    uint8_t payload_length, payload_counter;
+    uint8_t step;
+    uint8_t ck_a, ck_b;
+};
+#endif
+
 #if AP_GPS_ERB_ENABLED
 struct ERB_detect_state {
     uint8_t payload_length, payload_counter;

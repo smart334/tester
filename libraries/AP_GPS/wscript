@@ -1,4 +1,5 @@
 
-# SBF driver needs double precision
+# SBF driver needs double precision, as does the ECEF to geodetic
+# conversion in the passive u-blox driver
 def configure(cfg):
-    cfg.env.DOUBLE_PRECISION_SOURCES['AP_GPS'] = ['AP_GPS_SBF.cpp']
+    cfg.env.DOUBLE_PRECISION_SOURCES['AP_GPS'] = ['AP_GPS_SBF.cpp', 'AP_GPS_UBLOX_PASSIVE.cpp']

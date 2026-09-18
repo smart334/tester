@@ -38,6 +38,7 @@
 #include "AP_GPS_SBP2.h"
 #include "AP_GPS_SIRF.h"
 #include "AP_GPS_UBLOX.h"
+#include "AP_GPS_UBLOX_PASSIVE.h"
 #include "AP_GPS_MAV.h"
 #include "AP_GPS_MSP.h"
 #include "AP_GPS_ExternalAHRS.h"
@@ -555,6 +556,11 @@ void AP_GPS::send_blob_start(uint8_t instance)
 #if AP_SIM_GPS_ENABLED
     case GPS_TYPE_SITL:
 #endif  // AP_SIM_GPS_ENABLED
+#if AP_GPS_UBLOX_PASSIVE_ENABLED
+    // the passive u-blox driver must not put anything on the module's
+    // RX line, so it gets no initialisation blob either
+    case GPS_TYPE_UBLOX_PASSIVE:
+#endif
         // none of these GPSs have initialisation blobs
         break;
     default:
@@ -769,6 +775,15 @@ AP_GPS_Backend *AP_GPS::_detect_instance(const uint8_t instance)
             return NEW_NOTHROW AP_GPS_UBLOX(*this, params[instance], state[instance], port, role);
         }
 #endif  // AP_GPS_UBLOX_ENABLED
+#if AP_GPS_UBLOX_PASSIVE_ENABLED
+        // the passive driver sends nothing, so it cannot coax a module
+        // into UBX or into a known baud rate. We accept a valid UBX
+        // frame at whatever baud rate we are currently probing
+        if (type == GPS_TYPE_UBLOX_PASSIVE &&
+            AP_GPS_UBLOX_PASSIVE::_detect(dstate->ublox_passive_detect_state, data)) {
+            return NEW_NOTHROW AP_GPS_UBLOX_PASSIVE(*this, params[instance], state[instance], port);
+        }
+#endif  // AP_GPS_UBLOX_PASSIVE_ENABLED
 #if AP_GPS_SBP2_ENABLED
         if ((type == GPS_TYPE_AUTO || type == GPS_TYPE_SBP) &&
                  AP_GPS_SBP2::_detect(dstate->sbp2_detect_state, data)) {

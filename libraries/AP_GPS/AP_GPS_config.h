@@ -101,6 +101,12 @@
   #define AP_GPS_UBLOX_CFGV2_ENABLED AP_GPS_UBLOX_ENABLED && HAL_PROGRAM_SIZE_LIMIT_KB > 1024
 #endif
 
+// receive-only u-blox driver, for a module which streams UBX of its own
+// accord and must not be written to
+#ifndef AP_GPS_UBLOX_PASSIVE_ENABLED
+  #define AP_GPS_UBLOX_PASSIVE_ENABLED AP_GPS_BACKEND_DEFAULT_ENABLED && HAL_PROGRAM_SIZE_LIMIT_KB > 1024
+#endif
+
 #ifndef AP_GPS_RTCM_DECODE_ENABLED
   #define AP_GPS_RTCM_DECODE_ENABLED HAL_PROGRAM_SIZE_LIMIT_KB > 1024
 #endif

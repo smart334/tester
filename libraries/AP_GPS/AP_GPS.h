@@ -63,6 +63,7 @@ class AP_GPS
     friend class AP_GPS_SBP2;
     friend class AP_GPS_SIRF;
     friend class AP_GPS_UBLOX;
+    friend class AP_GPS_UBLOX_PASSIVE;
     friend class AP_GPS_Backend;
     friend class AP_GPS_DroneCAN;
     friend class AP_GPS_UBLOX_CFGv2;
@@ -110,6 +111,7 @@ public:
         GPS_TYPE_UNICORE_NMEA = 24,
         GPS_TYPE_UNICORE_MOVINGBASE_NMEA = 25,
         GPS_TYPE_SBF_DUAL_ANTENNA = 26,
+        GPS_TYPE_UBLOX_PASSIVE = 27,  // receive-only u-blox, module streams UBX unprompted
 #if AP_SIM_GPS_ENABLED
         GPS_TYPE_SITL = 100,
 #endif
@@ -707,6 +709,9 @@ private:
         bool auto_detected_baud;
 #if AP_GPS_UBLOX_ENABLED
         struct UBLOX_detect_state ublox_detect_state;
+#endif
+#if AP_GPS_UBLOX_PASSIVE_ENABLED
+        struct UBLOX_PASSIVE_detect_state ublox_passive_detect_state;
 #endif
 #if AP_GPS_SIRF_ENABLED
         struct SIRF_detect_state sirf_detect_state;
