@@ -16187,6 +16187,8 @@ switch value'''
             # if gps_type is None we auto-detect
             # (0, "NONE"),
             (1, "UBLOX", None, "u-blox", 5, 'probing'),
+            # the passive driver decodes the same stream but never writes to the module
+            (1, "UBLOX_PASSIVE", 27, "u-blox-passive", 5, 'probing'),
             (5, "NMEA", 5, "NMEA", 5, 'probing'),
             (6, "SBP", None, "SBP", 5, 'probing'),
             (8, "NOVA", 15, "NOVA", 5, 'probing'),  # no attempt to auto-detect this in AP_GPS
