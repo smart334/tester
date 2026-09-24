@@ -487,11 +487,19 @@ bool AP_InertialSensor_ADIS16488::init()
     }
     if (!found) {
         /*
-          0x0000 usually means MISO is stuck low or the part has no
-          power, 0xFFFF that MISO is floating or chip select never
-          asserts. Anything else is a different part on this bus.
+          0xFFFF is MISO high on every bit, so nothing is driving it: the
+          part is unpowered, held in reset, never selected, or its DOUT
+          does not reach us. 0x0000 is MISO held low. Anything else is a
+          different part on this bus. Say which, as the raw value alone
+          means nothing to whoever is reading the ground station.
          */
-        report_failure("bad PROD_ID 0x%04x want 0x%04x", (unsigned)prod_id, (unsigned)PROD_ID_16488);
+        if (prod_id == 0xFFFF) {
+            report_failure("PROD_ID 0xFFFF: nothing driving MISO");
+        } else if (prod_id == 0x0000) {
+            report_failure("PROD_ID 0x0000: MISO held low");
+        } else {
+            report_failure("bad PROD_ID 0x%04x want 0x%04x", (unsigned)prod_id, (unsigned)PROD_ID_16488);
+        }
         return false;
     }
 
@@ -537,14 +545,18 @@ bool AP_InertialSensor_ADIS16488::init()
         return false;
     }
 
+#if !AP_INERTIALSENSOR_ADIS16488_READ_ONLY
     /*
-      The part may be trimming its own output. That has to be known
-      before the scale factors are trusted, and it is only a page
-      select and a dozen reads, so it is worth doing even on a board
-      whose writes do not land: the page select is the only write and
-      a failed one is reported rather than believed.
+      The part may be trimming its own output, which has to be known
+      before the scale factors are trusted. It takes a page select, so a
+      read only build must not do it: that build promises to write
+      nothing, and it boots assuming the part is on page 0. A select
+      that lands on a board whose writes are unreliable, without the
+      return to page 0 landing after it, leaves the part somewhere the
+      next boot never looks until it is power cycled.
      */
     check_user_calibration();
+#endif
 
 #if AP_INERTIALSENSOR_ADIS16488_READ_ONLY
     /*
