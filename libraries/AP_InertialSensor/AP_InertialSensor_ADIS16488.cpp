@@ -1094,6 +1094,9 @@ void AP_InertialSensor_ADIS16488::read_sensor(void)
 {
     uint16_t vals[NUM_DATA_REGS];
 
+    // taken before the transfer, as close to the data ready edge as we get
+    const uint64_t sample_us = AP_HAL::micros64();
+
     if (!fetch_sample(vals)) {
         return;
     }
@@ -1146,11 +1149,19 @@ void AP_InertialSensor_ADIS16488::read_sensor(void)
     }
 #endif
 
+    /*
+      Give the frontend the time each sample was taken. Without it the
+      frontend integrates with the period it expects rather than the one
+      that happened, and only learns our real rate over the first thirty
+      seconds: until then every turn reads short. With no FIFO, how far
+      apart our samples land is whatever the loop managed, so it is the
+      timestamps that are right.
+     */
     _rotate_and_correct_accel(accel_instance, accel);
-    _notify_new_accel_raw_sample(accel_instance, accel);
+    _notify_new_accel_raw_sample(accel_instance, accel, sample_us);
 
     _rotate_and_correct_gyro(gyro_instance, gyro);
-    _notify_new_gyro_raw_sample(gyro_instance, gyro);
+    _notify_new_gyro_raw_sample(gyro_instance, gyro, sample_us);
 
     /*
       publish average temperature at 20Hz
