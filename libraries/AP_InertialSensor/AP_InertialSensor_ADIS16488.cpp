@@ -249,6 +249,13 @@ static_assert(AP_INERTIALSENSOR_ADIS16488_ASSUMED_ACCEL_GAIN > 0.5f &&
 // seconds between accelerometer reports when debugging
 #define ACCEL_REPORT_SEC 2U
 
+/*
+  data ready waits that may time out in a row before we stop waiting on
+  the line and keep time ourselves. A working line misses almost never,
+  as each wait allows two sample periods.
+ */
+#define DRDY_MAX_MISSES 100U
+
 extern const AP_HAL::HAL& hal;
 
 /*
@@ -1184,13 +1191,29 @@ void AP_InertialSensor_ADIS16488::loop(void)
     // give the data ready line two sample periods before falling back
     // on our own timing
     const uint32_t drdy_timeout_us = 2 * (period_us + 20U);
+    bool use_drdy = drdy_pin != 0;
+    uint16_t drdy_misses = 0;
 
     while (true) {
         const uint32_t tstart = AP_HAL::micros();
         bool wait_ok = false;
-        if (drdy_pin != 0) {
+        if (use_drdy) {
             // when we have a DRDY pin then wait for it to go high
             wait_ok = hal.gpio->wait_pin(drdy_pin, AP_HAL::GPIO::INTERRUPT_RISING, drdy_timeout_us);
+            if (wait_ok) {
+                drdy_misses = 0;
+            } else if (++drdy_misses >= DRDY_MAX_MISSES) {
+                /*
+                  Each missed edge costs the whole timeout before we
+                  read, so a line that never pulses holds us to well
+                  under half the rate we declared. Stop waiting on it and
+                  keep time ourselves, which the rest of this loop
+                  already does.
+                 */
+                use_drdy = false;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ADIS16488: no data ready on pin %u, using timer",
+                              (unsigned)drdy_pin);
+            }
         }
         read_sensor();
 
