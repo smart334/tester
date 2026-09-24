@@ -67,6 +67,19 @@ static_assert(AP_INERTIALSENSOR_ADIS16488_ASSUMED_ACCEL_GAIN > 0.5f &&
               "ADIS16488 assumed accel gain must be between 0.5 and 2");
 
 /*
+  the same for the gyros. Nothing in ArduPilot calibrates gyro scale, so
+  unlike the accelerometers there is no calibration to catch a wrong
+  value here: set it only from a measured turn (see the rotation report
+  when debugging), never by analogy with the accelerometer gain.
+ */
+#ifndef AP_INERTIALSENSOR_ADIS16488_ASSUMED_GYRO_GAIN
+#define AP_INERTIALSENSOR_ADIS16488_ASSUMED_GYRO_GAIN 1.0f
+#endif
+static_assert(AP_INERTIALSENSOR_ADIS16488_ASSUMED_GYRO_GAIN > 0.5f &&
+              AP_INERTIALSENSOR_ADIS16488_ASSUMED_GYRO_GAIN < 2.0f,
+              "ADIS16488 assumed gyro gain must be between 0.5 and 2");
+
+/*
   registers are identified by the page they live on as well as their
   address, as the whole map is 13 pages of 64 sixteen bit registers
  */
@@ -604,11 +617,17 @@ bool AP_InertialSensor_ADIS16488::init()
       only correct a scale error up to 20%, so a part that reports well
       away from the datasheet has to be corrected here or not at all.
      */
-    const float assumed_gain = AP_INERTIALSENSOR_ADIS16488_ASSUMED_ACCEL_GAIN;
-    if (!user_cal_known && !is_equal(assumed_gain, 1.0f)) {
-        accel_scale *= 1.0f / assumed_gain;
+    const float assumed_accel_gain = AP_INERTIALSENSOR_ADIS16488_ASSUMED_ACCEL_GAIN;
+    const float assumed_gyro_gain = AP_INERTIALSENSOR_ADIS16488_ASSUMED_GYRO_GAIN;
+    if (!user_cal_known && !is_equal(assumed_accel_gain, 1.0f)) {
+        accel_scale *= 1.0f / assumed_accel_gain;
         GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ADIS16488: assuming accel gain %.4f",
-                      double(assumed_gain));
+                      double(assumed_accel_gain));
+    }
+    if (!user_cal_known && !is_equal(assumed_gyro_gain, 1.0f)) {
+        gyro_scale *= 1.0f / assumed_gyro_gain;
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ADIS16488: assuming gyro gain %.4f",
+                      double(assumed_gyro_gain));
     }
 
 #if AP_INERTIALSENSOR_ADIS16488_READ_ONLY
