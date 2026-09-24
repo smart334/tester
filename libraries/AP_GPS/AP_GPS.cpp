@@ -1350,6 +1350,20 @@ void AP_GPS::lock_port(uint8_t instance, bool lock)
     }
 }
 
+/*
+  return the UART a GPS instance is attached to, so that code outside
+  the GPS drivers can write to the receiver. See the declaration in
+  AP_GPS.h for what the caller is responsible for.
+ */
+AP_HAL::UARTDriver *AP_GPS::get_serial_port(uint8_t instance)
+{
+    const AP_GPS *gps = get_singleton();
+    if (gps == nullptr || instance >= ARRAY_SIZE(gps->_port)) {
+        return nullptr;
+    }
+    return gps->_port[instance];
+}
+
 // Inject a packet of raw binary to a GPS
 void AP_GPS::inject_data(const uint8_t *data, uint16_t len)
 {

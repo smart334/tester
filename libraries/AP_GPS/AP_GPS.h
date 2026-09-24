@@ -518,6 +518,26 @@ public:
     // lock out a GPS port, allowing another application to use the port
     void lock_port(uint8_t instance, bool locked);
 
+    /*
+      return the UART a GPS instance is attached to, or nullptr when it
+      has no UART: the instance is not a serial GPS, no SERIALn_PROTOCOL
+      is set to GPS for it, or AP_GPS::init() has not run yet.
+
+      This is for code outside the GPS drivers which needs to send bytes
+      to the receiver itself. The transmit side is then the caller's:
+
+        - check txspace() and honour the return of write(), which is a
+          short count when the buffer is full
+        - only write once the GPS has been detected. Until then the port
+          is still cycling through baud rates, so bytes go out at
+          whatever rate is currently being probed
+        - most GPS drivers configure the receiver over this same port,
+          so an external writer interleaves with them. GPS_TYPE 27
+          (u-blox passive) never writes, which makes it the one to pair
+          with a writer of your own
+     */
+    static AP_HAL::UARTDriver *get_serial_port(uint8_t instance);
+
     //MAVLink Status Sending
     void send_mavlink_gps_raw(mavlink_channel_t chan);
     void send_mavlink_gps2_raw(mavlink_channel_t chan);
