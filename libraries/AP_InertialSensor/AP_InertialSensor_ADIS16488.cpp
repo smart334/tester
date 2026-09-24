@@ -48,6 +48,25 @@
 #endif
 
 /*
+  the gain a part applies to its own accelerometer output, for use when
+  the driver cannot read it back from the part. That is always the case
+  in a read only build, and in any build where page 2 cannot be
+  selected. Where the driver can read the part's scale registers it uses
+  those and ignores this.
+
+  Leave it at 1 for a part at its defaults. Set it from hwdef only for a
+  part known to report away from the datasheet sensitivity, for example
+  0.8 for one reading 0.8g lying level, and remove it if that part is
+  ever replaced: it describes one sensor, not the board.
+ */
+#ifndef AP_INERTIALSENSOR_ADIS16488_ASSUMED_ACCEL_GAIN
+#define AP_INERTIALSENSOR_ADIS16488_ASSUMED_ACCEL_GAIN 1.0f
+#endif
+static_assert(AP_INERTIALSENSOR_ADIS16488_ASSUMED_ACCEL_GAIN > 0.5f &&
+              AP_INERTIALSENSOR_ADIS16488_ASSUMED_ACCEL_GAIN < 2.0f,
+              "ADIS16488 assumed accel gain must be between 0.5 and 2");
+
+/*
   registers are identified by the page they live on as well as their
   address, as the whole map is 13 pages of 64 sixteen bit registers
  */
@@ -555,8 +574,23 @@ bool AP_InertialSensor_ADIS16488::init()
       return to page 0 landing after it, leaves the part somewhere the
       next boot never looks until it is power cycled.
      */
-    check_user_calibration();
+    const bool user_cal_known = check_user_calibration();
+#else
+    const bool user_cal_known = false;
 #endif
+
+    /*
+      Where the part's own gain could not be read, fall back to the one
+      the board says this part carries. The frontend's calibration can
+      only correct a scale error up to 20%, so a part that reports well
+      away from the datasheet has to be corrected here or not at all.
+     */
+    const float assumed_gain = AP_INERTIALSENSOR_ADIS16488_ASSUMED_ACCEL_GAIN;
+    if (!user_cal_known && !is_equal(assumed_gain, 1.0f)) {
+        accel_scale *= 1.0f / assumed_gain;
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ADIS16488: assuming accel gain %.4f",
+                      double(assumed_gain));
+    }
 
 #if AP_INERTIALSENSOR_ADIS16488_READ_ONLY
     /*
