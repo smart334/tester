@@ -163,6 +163,16 @@ private:
 
     // counts samples between accel reports when debugging
     uint32_t accel_report_count;
+    uint32_t report_start_us;
+
+    // when the previous sample was taken
+    uint64_t last_sample_us;
+
+    // a rotation being integrated from the gyros when debugging, and
+    // when the board last came to rest during it
+    Vector3f rot_angle;
+    uint32_t rot_still_us;
+    bool rot_moving;
 
     // running temperature average, published to the frontend at 20Hz
     float temp_sum;

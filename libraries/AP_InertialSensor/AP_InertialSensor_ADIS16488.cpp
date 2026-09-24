@@ -256,6 +256,14 @@ static_assert(AP_INERTIALSENSOR_ADIS16488_ASSUMED_ACCEL_GAIN > 0.5f &&
  */
 #define DRDY_MAX_MISSES 100U
 
+/*
+  rotation report when debugging: a turn starts when the gyros exceed
+  ROT_MOVING_DPS and is reported once they have stayed under it for
+  ROT_STILL_MS
+ */
+#define ROT_MOVING_DPS 5.0f
+#define ROT_STILL_MS   1000U
+
 extern const AP_HAL::HAL& hal;
 
 /*
@@ -278,6 +286,10 @@ AP_InertialSensor_ADIS16488::AP_InertialSensor_ADIS16488(AP_InertialSensor &imu,
     , stall_us(T_STALL_INIT_US)
     , write_pad(WRITE_PAD_NONE)
     , accel_report_count(0)
+    , report_start_us(0)
+    , last_sample_us(0)
+    , rot_still_us(0)
+    , rot_moving(false)
     , temp_sum(0)
     , temp_count(0)
 {
@@ -1146,15 +1158,63 @@ void AP_InertialSensor_ADIS16488::read_sensor(void)
       scale factors are applied, so a failed calibration cannot colour
       the numbers.
      */
-    if (++accel_report_count >= uint32_t(expected_sample_rate_hz) * ACCEL_REPORT_SEC) {
+    /*
+      Reports go by the clock rather than by counting samples, so that
+      how many samples arrived in the interval is itself reported: that
+      is the rate we actually run at, to hold against the one we told the
+      frontend.
+     */
+    accel_report_count++;
+    const uint32_t now_us = AP_HAL::micros();
+    if (report_start_us == 0) {
+        report_start_us = now_us;
         accel_report_count = 0;
-        ADIS_DEBUG("a %d %d %d cnt |a| %.2f m/s2",
+    } else if (now_us - report_start_us >= ACCEL_REPORT_SEC * 1000000UL) {
+        const float actual_hz = accel_report_count * 1.0e6f / (now_us - report_start_us);
+        ADIS_DEBUG("a %d %d %d cnt |a| %.2f %uHz",
                    int(combine32(vals[IDX_AX_HIGH], vals[IDX_AX_LOW]) / 65536),
                    int(combine32(vals[IDX_AY_HIGH], vals[IDX_AY_LOW]) / 65536),
                    int(combine32(vals[IDX_AZ_HIGH], vals[IDX_AZ_LOW]) / 65536),
-                   double(accel.length()));
+                   double(accel.length()), unsigned(lrintf(actual_hz)));
+        accel_report_count = 0;
+        report_start_us = now_us;
+    }
+
+    /*
+      Report each turn as the angle the gyros integrate to, using our
+      own timestamps, so the gyro scale can be checked against a turn of
+      known size independently of the frontend's idea of our rate: yaw
+      the board a full circle flat on the bench back to a mark and it
+      should read 360. Integration starts when the board moves and ends
+      once it has been still for a second, so bias only accrues for the
+      length of the turn.
+     */
+    if (last_sample_us != 0) {
+        const float dt = (sample_us - last_sample_us) * 1.0e-6f;
+        const bool moving = gyro.length() > radians(ROT_MOVING_DPS);
+        if (moving) {
+            rot_moving = true;
+            rot_still_us = 0;
+        }
+        if (rot_moving && dt < 0.1f) {
+            rot_angle += gyro * dt;
+            if (moving) {
+                // still turning
+            } else if (rot_still_us == 0) {
+                rot_still_us = now_us;
+            } else if (now_us - rot_still_us >= ROT_STILL_MS * 1000UL) {
+                ADIS_DEBUG("rot %.1f %.1f %.1f deg",
+                           double(degrees(rot_angle.x)),
+                           double(degrees(rot_angle.y)),
+                           double(degrees(rot_angle.z)));
+                rot_angle.zero();
+                rot_moving = false;
+                rot_still_us = 0;
+            }
+        }
     }
 #endif
+    last_sample_us = sample_us;
 
     /*
       Give the frontend the time each sample was taken. Without it the
